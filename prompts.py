@@ -302,6 +302,7 @@ RULES:
 - Do NOT use `cd` — all commands run in the project directory already.
 - If renaming a file, use search_files to find ALL references and update them ALL before running tests.
 - package.json / tsconfig.json / *.config.* are protected — use add_dep(name, version, dev) to add deps.
+- IMPORT DISCIPLINE: every symbol you reference (class, function, type) MUST be imported at the top of the SAME module that uses it. Do NOT rely on package-level __init__.py re-exports — sibling modules don't inherit each other's namespaces. If you reference `curses.KEY_LEFT`, the file using it needs `import curses`. If a function uses `Optional`, that file needs `from typing import Optional`.
 
 {manifest_summary}
 
