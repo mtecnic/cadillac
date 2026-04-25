@@ -4252,6 +4252,7 @@ def enhance(
         return
 
     # Set up tools and code map
+    from .codemap import CodeMapBuilder
     progress = Progress(task=task, workspace=workspace)
     executor = ToolExecutor(workspace, manifest, progress_fn=progress.to_context,
                             context_budget=cfg.max_context_tokens)
