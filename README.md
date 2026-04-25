@@ -9,7 +9,9 @@
    ╚═════╝╚═╝  ╚═╝╚═════╝ ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝
 ```
 
-### *An autonomous LLM agent that builds entire applications from a sentence.*
+### **C**ritic · **A**utonomous · **D**ecomposing · **I**terative · **L**earning · **L**ifecycle · **A**daptive · **C**ompiler
+
+*A natural-language task in. A validated application out.*
 
 ![Python](https://img.shields.io/badge/python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/typescript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white)
@@ -58,6 +60,25 @@ The very first thing cadillac ever built — **2026-04-01** — was an asyncio I
 | Validations | 0 / 8 | **8 / 8** ✓ |
 
 The difference isn't a smarter model — it's 24 days of cadillac itself learning what breaks builds and how to prevent it. Every failure became a fix. Every fix became a test. Every test became a guardrail.
+
+---
+
+## 🔤 What's in the name
+
+Each letter ties to a *named subsystem in the codebase* — every word is something you can `grep` for in the source.
+
+| | Word | What it actually maps to | Lives in |
+|:---:|---|---|---|
+| **C** | **Critic-driven** | The REVIEW phase runs an adversarial critic against the scaffolded plan; the inspector then validates materials, wiring, and commissioning at phase boundaries. Cadillac argues with itself before it ships. | `prompts.build_review_prompt` · `inspector.inspect_*` |
+| **A** | **Autonomous** | One sentence in, working app out. Picks file order, retry counts, timeouts, version pins — without asking. The harness's job is to never push a decision back to the user when it can be inferred. | `engine.run` (the `while True` phase loop) |
+| **D** | **Decomposing** | 15+ file projects are decomposed into dependency-sorted modules, built in waves. Each module gets a scoped executor that can only touch its own directory. | `modules.ModularPlan` · `engine._build_module_wave` · `tools.ModuleScopedExecutor` |
+| **I** | **Iterative** | Every validation failure feeds back as `retreat_to_build`. The state machine doesn't fail — it loops with new context until the 8-check gate goes green or budget runs out. | `phases.PhaseState.retreat_to_build` |
+| **L** | **Learning** | `memory.jsonl` accumulates lessons (275 today, tag-filtered, confidence-scored, decay-aware). `phase_budgets.jsonl` records rounds-per-phase so the next build's budget is computed from the previous one's reality. | `memory.recall` · `memory.record_phase_outcome` |
+| **L** | **Lifecycle** | Full **PLAN → DEPS → SCAFFOLD → REVIEW → BUILD → INTEGRATE → VALIDATE → PACKAGE** pipeline. Not "code generation" — *application lifecycle*. The output is a packaged, runnable project with README and dep manifest. | `phases.Phase` · `phases.PHASE_ORDER` |
+| **A** | **Adaptive** | Every meaningful value is derived from a signal cadillac already sees. Timeouts from `cmd_history.jsonl`. Context budgets from `/v1/models`. Version pins from `node --version`. Phase budgets from p90 of past rounds. The user never tunes any of this. | `tools._adaptive_timeout` · `engine.compute_context_budget` · `inspector.approved_versions_for_host` · `phases.compute_budgets` |
+| **C** | **Compiler** | Task description in. **Validated** application out. Like a compiler, the artifact must pass an uncompromising check before it's emitted. Like a compiler, the output is deterministic given the same input + memory state + seed. | `validate.run_validation` (the 8-check gate) |
+
+> *Cadillac is a* ***critic-driven, autonomous, decomposing, iterative, learning lifecycle*** *for* ***adaptive compilation*** *of natural-language tasks into validated applications.*
 
 ---
 
