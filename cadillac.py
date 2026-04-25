@@ -197,6 +197,12 @@ def cmd_shell(args, cfg):
     interactive_shell(cfg, os.getcwd(), use_rich=use_rich)
 
 
+def cmd_dash(args, cfg):
+    """Open the zero-service TUI dashboard."""
+    from cadillac.dash import run as run_dash
+    sys.exit(run_dash(root=getattr(args, "root", None)))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Cadillac — autonomous agent builder",
@@ -268,6 +274,14 @@ Examples:
     p_enhance.add_argument("workspace", help="Project directory")
     p_enhance.add_argument("task", nargs="+", help="What to add or fix")
 
+    # dash
+    p_dash = subparsers.add_parser(
+        "dash",
+        help="Zero-service TUI dashboard over workspaces, memory, and phase history",
+    )
+    p_dash.add_argument("root", nargs="?", default=None,
+                        help="Directory to scan for workspace-* dirs (default: cwd)")
+
     args = parser.parse_args()
 
     if args.context_auto:
@@ -318,6 +332,8 @@ Examples:
         cmd_debug(args, cfg)
     elif args.command == "enhance":
         cmd_enhance(args, cfg)
+    elif args.command == "dash":
+        cmd_dash(args, cfg)
     elif args.command is None:
         # No subcommand — check for legacy positional task or enter shell
         # Support legacy: python3 -m cadillac "task description"
