@@ -61,6 +61,33 @@ The very first thing cadillac ever built — **2026-04-01** — was an asyncio I
 
 The difference isn't a smarter model — it's 24 days of cadillac itself learning what breaks builds and how to prevent it. Every failure became a fix. Every fix became a test. Every test became a guardrail.
 
+#### 🔁 Then we asked it to **repair the original broken version**
+
+We copied the day-1 code into a fresh dir and ran:
+
+```bash
+$ python3 -m cadillac --api-url $LLM_URL enhance ./irc-server-broken \
+    "fix all these issues: <8 specific bugs>"
+```
+
+In **~7 minutes**, cadillac:
+
+- ✅ Found and fixed the `split(':',, 1)` syntax error on line 61
+- ✅ Wrote 3 new test files (`test_rate_limiter.py`, `test_channel_manager.py`, `test_irc_parser.py`) with real assertions
+- ✅ Got every check green: `naming · imports · syntax · lint · framework · functional · run · tests`
+- ✅ `[ENHANCE] All validations pass!`
+
+Two paths, same destination:
+
+```
+                       ┌──── BUILD FROM SCRATCH ────►  22 files · 8/8 · 45 min
+   "AI agent IRC      ─┤
+    server" task       └──── REPAIR THE BROKEN     ──►   3 tests added · 8/8 · 7 min
+                                  DAY-1 VERSION
+```
+
+Whether you start from a sentence or a broken codebase, the harness converges on the same place: green.
+
 ---
 
 ## 🔤 What's in the name
@@ -337,11 +364,19 @@ pytest covers game-logic only (no pygame imports in tests)
 exposed and drove fixes for 10+ cadillac framework bugs in the process
 ```
 
-#### 💬 AI Agent IRC Server — bake-off
+#### 💬 AI Agent IRC Server — built two ways
+
 ```
-22 files in 7 subpackages · 8/8 validations PASS · 45 minutes
-on Qwen3.6-27B with 131K context, all the auto-adaptive fixes engaged
+build from scratch → 22 files · 7 subpackages · 8/8 · 45 minutes
+                     (Qwen3.6-27B, 131K context, modular pipeline)
+
+repair broken v1   →  3 test files added · 8/8 · 7 minutes
+                     (cadillac enhance on the original day-1 codebase
+                      that had a syntax error and dead message queue)
 ```
+
+*The same task that produced cadillac's first-ever broken build can now
+be either built fresh or repaired in place — both reach all-green.*
 
 #### 🚀 TypeScript Express API — flat
 
