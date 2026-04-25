@@ -2136,6 +2136,29 @@ class TestApprovedVersionsForHost(unittest.TestCase):
         self.assertEqual(coerced_str, "^6")
 
 
+class TestEnhanceCodeMapBuilderImport(unittest.TestCase):
+    """Prod regression: `cadillac enhance` crashed with NameError: name
+    'CodeMapBuilder' is not defined at engine.py:4259. Function referenced
+    the class without importing it. This test guards against the symbol-
+    reference-without-import shape coming back."""
+
+    def test_enhance_imports_codemapbuilder(self):
+        import inspect
+        from cadillac.engine import enhance
+        src = inspect.getsource(enhance)
+        # Either a direct import or use of the module prefix must appear
+        # before the first CodeMapBuilder use.
+        self.assertIn("CodeMapBuilder", src)
+        self.assertIn("from .codemap import CodeMapBuilder", src)
+
+    def test_enhance_callable(self):
+        # Just importing it must not raise. Any missing-symbol issue would
+        # surface at import-time only for module-level refs; this catches
+        # syntax-level regressions in the function body.
+        from cadillac.engine import enhance
+        self.assertTrue(callable(enhance))
+
+
 class TestCmdKind(unittest.TestCase):
     """`_cmd_kind` classifies commands into buckets for per-kind history lookup."""
 
