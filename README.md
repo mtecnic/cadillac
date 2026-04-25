@@ -15,7 +15,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/typescript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-307%20passing-2ea44f?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-320%20passing-2ea44f?style=flat-square)
 ![Builds](https://img.shields.io/badge/applications%20built-92-blue?style=flat-square)
 ![Lessons](https://img.shields.io/badge/lessons%20learned-275-purple?style=flat-square)
 ![License](https://img.shields.io/badge/license-private-red?style=flat-square)
@@ -99,11 +99,11 @@ Each letter ties to a *named subsystem in the codebase* — every word is someth
 | **C** | **Critic-driven** | The REVIEW phase runs an adversarial critic against the scaffolded plan; the inspector then validates materials, wiring, and commissioning at phase boundaries. Cadillac argues with itself before it ships. | `prompts.build_review_prompt` · `inspector.inspect_*` |
 | **A** | **Autonomous** | One sentence in, working app out. Picks file order, retry counts, timeouts, version pins — without asking. The harness's job is to never push a decision back to the user when it can be inferred. | `engine.run` (the `while True` phase loop) |
 | **D** | **Decomposing** | 15+ file projects are decomposed into dependency-sorted modules, built in waves. Each module gets a scoped executor that can only touch its own directory. | `modules.ModularPlan` · `engine._build_module_wave` · `tools.ModuleScopedExecutor` |
-| **I** | **Iterative** | Every validation failure feeds back as `retreat_to_build`. The state machine doesn't fail — it loops with new context until the 8-check gate goes green or budget runs out. | `phases.PhaseState.retreat_to_build` |
+| **I** | **Iterative** | Every validation failure feeds back as `retreat_to_build`. The state machine doesn't fail — it loops with new context until the 10-check gate goes green or budget runs out. | `phases.PhaseState.retreat_to_build` |
 | **L** | **Learning** | `memory.jsonl` accumulates lessons (275 today, tag-filtered, confidence-scored, decay-aware). `phase_budgets.jsonl` records rounds-per-phase so the next build's budget is computed from the previous one's reality. | `memory.recall` · `memory.record_phase_outcome` |
 | **L** | **Lifecycle** | Full **PLAN → DEPS → SCAFFOLD → REVIEW → BUILD → INTEGRATE → VALIDATE → PACKAGE** pipeline. Not "code generation" — *application lifecycle*. The output is a packaged, runnable project with README and dep manifest. | `phases.Phase` · `phases.PHASE_ORDER` |
 | **A** | **Adaptive** | Every meaningful value is derived from a signal cadillac already sees. Timeouts from `cmd_history.jsonl`. Context budgets from `/v1/models`. Version pins from `node --version`. Phase budgets from p90 of past rounds. The user never tunes any of this. | `tools._adaptive_timeout` · `engine.compute_context_budget` · `inspector.approved_versions_for_host` · `phases.compute_budgets` |
-| **C** | **Compiler** | Task description in. **Validated** application out. Like a compiler, the artifact must pass an uncompromising check before it's emitted. Like a compiler, the output is deterministic given the same input + memory state + seed. | `validate.run_validation` (the 8-check gate) |
+| **C** | **Compiler** | Task description in. **Validated** application out. Like a compiler, the artifact must pass an uncompromising check before it's emitted. Like a compiler, the output is deterministic given the same input + memory state + seed. | `validate.run_validation` (the 10-check gate) |
 
 > *Cadillac is a* ***critic-driven, autonomous, decomposing, iterative, learning lifecycle*** *for* ***adaptive compilation*** *of natural-language tasks into validated applications.*
 
@@ -115,7 +115,7 @@ Each letter ties to a *named subsystem in the codebase* — every word is someth
 ┌─────────┐   ┌──────┐   ┌──────────┐   ┌────────┐   ┌───────┐   ┌─────────────┐   ┌──────────┐   ┌─────────┐
 │  PLAN   │ → │ DEPS │ → │ SCAFFOLD │ → │ REVIEW │ → │ BUILD │ → │  INTEGRATE  │ → │ VALIDATE │ → │ PACKAGE │
 └─────────┘   └──────┘   └──────────┘   └────────┘   └───────┘   └─────────────┘   └──────────┘   └─────────┘
-   plan       npm/pip      stub files    adversarial    fix         glue            8-check         README +
+   plan       npm/pip      stub files    adversarial    fix         glue            10-check        README +
    modular?   install                    critic         cycle       phase           pipeline        deps file
 ```
 
@@ -127,13 +127,16 @@ Both pipelines share the same phase state machine, adaptive budgets, memory, and
 
 ---
 
-## ✅ The 8-check validation gate
+## ✅ The 10-check validation gate
 
 ```
 ┌──────────────┬──────────────────────────────────────────────────────────────────┐
 │  syntax      │  py_compile / tsc --noEmit / node --check on every source file  │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  imports     │  every import resolves to stdlib, declared dep, or local module │
+├──────────────┼──────────────────────────────────────────────────────────────────┤
+│  static_names│  pyflakes scans for undefined-name bugs that NameError at        │
+│              │  runtime — catches "InputPoller used but not imported" pre-run  │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  lint        │  ruff / eslint with auto-configured safe rule set                │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
@@ -143,13 +146,19 @@ Both pipelines share the same phase state machine, adaptive budgets, memory, and
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  run         │  entry point executes a smoke-test invocation cleanly            │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
+│  smoke_run   │  for curses/pygame apps: monkey-patches a fake screen, runs the │
+│              │  REAL no-args entry path 60 frames — catches the broken main()  │
+│              │  paths that --test mode bypasses                                 │
+├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  tests       │  pytest / vitest / jest all green                                │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  naming      │  plan's declared module names match the filesystem               │
 └──────────────┴──────────────────────────────────────────────────────────────────┘
 ```
 
-Failing a check triggers retreat-to-BUILD, up to `max_validate_retries` cycles. When all 8 pass, `PACKAGE` writes the README and `requirements.txt` / `package.json`.
+Failing a check triggers retreat-to-BUILD, up to `max_validate_retries` cycles. When all 10 pass, `PACKAGE` writes the README and `requirements.txt` / `package.json`.
+
+The two newest checks (`static_names`, `smoke_run`) close a recurring failure mode: code reachable from `main()` but not from `--test` would slip through every other check and crash on first launch. `static_names` catches the bulk via pyflakes (undefined names); `smoke_run` walks the actual interactive entry path with a fake stdscr to catch what static can't see.
 
 ---
 
@@ -278,7 +287,7 @@ cadillac/
 ├── 🧱  modules.py         ModuleSpec, ModularPlan, dependency topo-sort, cycle detection
 ├── 📝  prompts.py         LLM templates for each phase (flat + modular variants)
 ├── 🔨  tools.py           ToolExecutor + ModuleScopedExecutor, sandboxed I/O
-├── ✅  validate.py        The 8-check pipeline, per-language validators
+├── ✅  validate.py        The 10-check pipeline, per-language validators
 ├── 🎯  phases.py          Phase enum, budgets, PhaseState, retry logic
 ├── 📋  manifest.py        Thread-safe file registry with structural summaries
 ├── 🔍  inspector.py       3-tier building-code enforcement (materials/wiring/commissioning)

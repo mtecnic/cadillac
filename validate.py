@@ -207,6 +207,272 @@ def check_lint(workspace: str, lang=None) -> list[CheckResult]:
     return [CheckResult("lint", True)]
 
 
+_SMOKE_RUN_TIMEOUT_S = 5
+_SMOKE_RUN_MAX_FRAMES = 60
+
+# A self-contained harness: monkey-patch curses.wrapper / set SDL env BEFORE
+# user code runs, then exec main.py via runpy with __name__ == "__main__" so
+# the natural entry-point block fires. After N frames or timeout, the fake
+# screen returns the quit key and the loop should exit cleanly. Any
+# uncaught exception (NameError, AttributeError, signature mismatch) is
+# captured by the parent and rendered as a check failure.
+_SMOKE_HARNESS = '''
+import sys, os, traceback
+WS = sys.argv[1]
+# Reset argv so the user's main() / Click / argparse sees a clean no-args
+# invocation — our workspace path was a harness arg, not user input.
+sys.argv = [os.path.join(WS, "main.py")]
+sys.path.insert(0, WS)
+os.chdir(WS)
+
+# Headless display flags for any pygame usage. Cheap to set even when unused.
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
+# Monkey-patch curses.wrapper if curses is involved. We only do this when
+# `import curses` appears somewhere in the workspace (caller has filtered).
+_curses_wrapper_called = False
+try:
+    import curses
+    _MAX = {max_frames}
+    class _FakeScreen:
+        def __init__(self):
+            self._frames = 0
+        def timeout(self, *a): pass
+        def keypad(self, *a): pass
+        def nodelay(self, *a): pass
+        def leaveok(self, *a): pass
+        def clear(self): pass
+        def erase(self): pass
+        def refresh(self): self._frames += 1
+        def noutrefresh(self): self._frames += 1
+        def addstr(self, *a, **kw): pass
+        def addch(self, *a, **kw): pass
+        def attron(self, *a, **kw): pass
+        def attroff(self, *a, **kw): pass
+        def move(self, *a, **kw): pass
+        def border(self, *a, **kw): pass
+        def box(self, *a, **kw): pass
+        def getmaxyx(self):
+            return (40, 100)
+        def getch(self):
+            # First few frames: action keys; then quit.
+            if self._frames < _MAX // 3:
+                return ord(" ")
+            if self._frames < (2 * _MAX) // 3:
+                return curses.KEY_RIGHT
+            return ord("q")
+        def derwin(self, *a, **kw): return _FakeScreen()
+        def subwin(self, *a, **kw): return _FakeScreen()
+
+    def _fake_wrapper(fn, *a, **kw):
+        global _curses_wrapper_called
+        _curses_wrapper_called = True
+        return fn(_FakeScreen(), *a, **kw)
+    curses.wrapper = _fake_wrapper
+    _curses_was_imported = True
+except ImportError:
+    _curses_was_imported = False
+
+# Run main.py as if invoked from CLI. runpy fires the `if __name__ == "__main__"`
+# block, so the real entry path executes — not just `--test`.
+import runpy
+def _post_check():
+    # If curses was in the project but our fake wrapper was never invoked,
+    # the entry point bypassed the interactive loop entirely (broken cli()
+    # function, missing __main__ block, etc.). User runs `python3 main.py`
+    # and sees nothing.
+    if _curses_was_imported and not _curses_wrapper_called:
+        print("SMOKE_FAIL: curses framework present but main entry never called curses.wrapper "
+              "(user-facing launch is broken — likely cli()/__main__ misroute)")
+        sys.exit(1)
+    print("SMOKE_OK")
+    sys.exit(0)
+
+try:
+    runpy.run_path(os.path.join(WS, "main.py"), run_name="__main__")
+    _post_check()
+except SystemExit as e:
+    # main() may sys.exit(0) cleanly; treat as success
+    if (e.code or 0) == 0:
+        _post_check()
+    print("SMOKE_FAIL: SystemExit({{}})".format(e.code))
+    sys.exit(1)
+except Exception as e:
+    print("SMOKE_FAIL:", type(e).__name__, str(e))
+    traceback.print_exc()
+    sys.exit(1)
+'''
+
+
+def _detect_interactive_framework(workspace: str) -> str | None:
+    """Return 'curses', 'pygame', or None based on source-file imports."""
+    has_curses = False
+    has_pygame = False
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in {
+            "__pycache__", ".venv", "node_modules", ".git", ".cadillac",
+        }]
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            try:
+                with open(os.path.join(root, f), errors="replace") as fh:
+                    content = fh.read(8000)
+            except OSError:
+                continue
+            if re.search(r"^\s*import\s+curses|^\s*from\s+curses", content, re.M):
+                has_curses = True
+            if re.search(r"^\s*import\s+pygame|^\s*from\s+pygame", content, re.M):
+                has_pygame = True
+    if has_curses:
+        return "curses"
+    if has_pygame:
+        return "pygame"
+    return None
+
+
+def check_smoke_run(workspace: str, lang=None) -> list[CheckResult]:
+    """Exercise the no-args interactive entry path with a fake screen.
+
+    The recurring bug class this catches: code reachable from `main()` but
+    NOT from `--test` mode. Our existing `run` check invokes `main.py --test`
+    which short-circuits to pure-logic unit tests; the actual game/server
+    loop is never touched. A NameError, signature mismatch, or unhandled
+    exception in the real entry path passes every other validation and
+    crashes on first real launch.
+
+    Approach: spawn `python3 _harness.py <workspace>` where the harness
+    monkey-patches curses.wrapper with a FakeScreen (returns synthetic
+    keys for ~60 frames then 'q') and sets SDL_VIDEODRIVER=dummy. Run
+    main.py via runpy so __main__ fires. Capture exceptions; report as FAIL.
+
+    Only fires for Python projects that import curses or pygame. Pure-CLI
+    or web/server projects skip cleanly — their interactive surface is
+    network or stdin, both already covered by `run`/`tests`.
+    """
+    if not lang or lang.family != "python":
+        return [CheckResult("smoke_run", True,
+                            f"Smoke-run is interactive-Python-only; {lang.name if lang else '?'} skipped",
+                            "info")]
+    framework = _detect_interactive_framework(workspace)
+    if framework is None:
+        return [CheckResult("smoke_run", True,
+                            "No curses/pygame usage detected, skipped", "info")]
+    if not os.path.exists(os.path.join(workspace, "main.py")):
+        return [CheckResult("smoke_run", True,
+                            "No main.py found, skipped", "info")]
+
+    # Materialize the harness to a temp file so exceptions reference real lines
+    import tempfile
+    harness_src = _SMOKE_HARNESS.format(max_frames=_SMOKE_RUN_MAX_FRAMES)
+    with tempfile.NamedTemporaryFile(mode="w", suffix="_smoke.py",
+                                       delete=False) as f:
+        f.write(harness_src)
+        harness_path = f.name
+    try:
+        r = _run(["python3", harness_path, workspace],
+                 cwd=workspace, timeout=_SMOKE_RUN_TIMEOUT_S)
+    finally:
+        try:
+            os.unlink(harness_path)
+        except OSError:
+            pass
+    output = (r.stdout + "\n" + r.stderr).strip()
+    if "SMOKE_OK" in output and r.returncode == 0:
+        return [CheckResult("smoke_run", True,
+                            f"{framework}: entry path ran {_SMOKE_RUN_MAX_FRAMES} frames clean")]
+    # Truncate to the relevant traceback portion
+    fail_msg = output[-2000:]
+    return [CheckResult("smoke_run", False,
+                        f"{framework} entry path crashed: {fail_msg}")]
+
+
+def _ensure_pyflakes() -> bool:
+    """Ensure pyflakes is importable. Auto-install on PEP 668 hosts."""
+    try:
+        import pyflakes  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    # Try to install — best effort. PEP 668-aware.
+    try:
+        proc = subprocess.run(
+            ["pip", "install", "--break-system-packages", "--quiet", "pyflakes"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode != 0:
+            subprocess.run(
+                ["pip", "install", "--user", "--quiet", "pyflakes"],
+                capture_output=True, text=True, timeout=60,
+            )
+    except (subprocess.SubprocessError, OSError):
+        pass
+    try:
+        import pyflakes  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def check_static_names(workspace: str, lang=None) -> list[CheckResult]:
+    """Catch undefined-name bugs that don't surface until the runtime path
+    that references them is actually executed.
+
+    The recurring failure mode this blocks: a module references a class or
+    function (e.g. `InputPoller`, `Optional`, `curses`) without importing
+    it; the syntax check passes (parseable), the imports check passes
+    (declared imports resolve), the run check passes (--test mode never
+    enters the broken code path), and the build ships green but crashes
+    on first real launch.
+
+    Python: `pyflakes` reports `undefined name '<X>'` per file:line — fast,
+    deterministic, no false positives on normal code. Ignores unused-import
+    noise (that's lint, not correctness).
+
+    TypeScript: handled by `check_syntax` already (`tsc --noEmit` resolves
+    every name during type-check). This check is a no-op there.
+    """
+    if not lang or lang.family != "python":
+        return [CheckResult("static_names", True,
+                            f"Static-name check is Python-only; {lang.name if lang else '?'} relies on its compiler",
+                            "info")]
+    if not _ensure_pyflakes():
+        return [CheckResult("static_names", True,
+                            "pyflakes not installed and auto-install failed, skipped",
+                            "warning")]
+
+    # Walk all .py source files in workspace, skipping caches/venv/tests-only-via-conftest
+    py_files: list[str] = []
+    for root, dirs, files in os.walk(workspace):
+        # Mutate dirs in place to skip these subtrees
+        dirs[:] = [d for d in dirs if d not in {
+            "__pycache__", ".venv", "venv", "node_modules",
+            ".pytest_cache", ".git", ".cadillac", "dist",
+        }]
+        for f in files:
+            if f.endswith(".py"):
+                py_files.append(os.path.relpath(os.path.join(root, f), workspace))
+    if not py_files:
+        return [CheckResult("static_names", True, "No .py files to scan", "info")]
+
+    r = _run(["python3", "-m", "pyflakes"] + py_files, cwd=workspace, timeout=30)
+    # pyflakes returns non-zero when issues found, prints "<path>:<line>:<col>: <msg>"
+    issues = (r.stdout or "").strip().splitlines()
+    # Filter to bug-shaped diagnostics — `undefined name` is the killer.
+    # Ignore "imported but unused" / "redefined" / "may be undefined" — those
+    # are style, not correctness, and `lint` already handles them.
+    bug_keywords = ("undefined name", "syntax error", "may be undefined")
+    bugs = [line for line in issues if any(k in line for k in bug_keywords)]
+    if not bugs:
+        return [CheckResult("static_names", True,
+                            f"{len(py_files)} files scanned, no undefined-name bugs")]
+    output = "\n".join(bugs[:30])
+    if len(bugs) > 30:
+        output += f"\n... and {len(bugs) - 30} more"
+    return [CheckResult("static_names", False, output)]
+
+
 def _check_lint_ts(workspace: str) -> list[CheckResult]:
     """Run eslint on TS/JS files."""
     # ESLint 9+ requires eslint.config.js (flat config). Skip if not present.
@@ -1157,15 +1423,17 @@ def run_validation(
     expected_packages: list[str] | None = None,
     lang=None,
 ) -> list[CheckResult]:
-    """Run the full validation pipeline."""
+    """Run the full validation pipeline (10 checks)."""
     results = []
     results.extend(check_stdlib_conflicts(workspace, lang))
     results.extend(check_imports(workspace, lang))
+    results.extend(check_static_names(workspace, lang))   # catches NameErrors statically
     results.extend(check_syntax(workspace, lang))
     results.extend(check_lint(workspace, lang))
     results.extend(check_framework_conflicts(workspace, expected_packages=expected_packages, lang=lang))
     results.extend(check_functional_smoke(workspace, entry_point, lang))
     results.extend(check_entry_point(workspace, entry_point, lang))
+    results.extend(check_smoke_run(workspace, lang))      # catches NameErrors in interactive-loop paths
     results.extend(check_tests(workspace, lang))
     return results
 
@@ -1184,9 +1452,9 @@ def format_failures(results: list[CheckResult]) -> str:
 def results_to_dict(results: list[CheckResult]) -> dict[str, bool | None]:
     """Convert results to a simple dict for progress tracking."""
     d: dict[str, bool | None] = {
-        "naming": None, "imports": None,
+        "naming": None, "imports": None, "static_names": None,
         "syntax": None, "lint": None, "framework": None,
-        "functional": None, "run": None, "tests": None,
+        "functional": None, "run": None, "smoke_run": None, "tests": None,
     }
     for r in results:
         if r.name in d:
