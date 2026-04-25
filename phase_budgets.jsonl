@@ -1,0 +1,81 @@
+{"ts": 1776999181.9226735, "phase": "plan", "rounds": 2, "n_files": 8, "tags": ["typescript", "jest", "express"]}
+{"ts": 1776999181.9227586, "phase": "deps", "rounds": 1, "n_files": 8, "tags": ["typescript", "jest", "express"]}
+{"ts": 1776999181.9227931, "phase": "scaffold", "rounds": 7, "n_files": 8, "tags": ["typescript", "jest", "express"]}
+{"ts": 1776999181.9228199, "phase": "review", "rounds": 6, "n_files": 8, "tags": ["typescript", "jest", "express"]}
+{"ts": 1776999181.9228442, "phase": "build", "rounds": 27, "n_files": 8, "tags": ["typescript", "jest", "express"]}
+{"ts": 1776999181.9228678, "phase": "integrate", "rounds": 6, "n_files": 8, "tags": ["typescript", "jest", "express"]}
+{"ts": 1777003406.9197059, "phase": "plan", "rounds": 3, "n_files": 13, "tags": ["pytest", "pygame"]}
+{"ts": 1777003406.919773, "phase": "deps", "rounds": 1, "n_files": 13, "tags": ["pytest", "pygame"]}
+{"ts": 1777003406.919802, "phase": "review", "rounds": 6, "n_files": 13, "tags": ["pytest", "pygame"]}
+{"ts": 1777003406.9198246, "phase": "build", "rounds": 1, "n_files": 13, "tags": ["pytest", "pygame"]}
+{"ts": 1777003406.919846, "phase": "integrate", "rounds": 2, "n_files": 13, "tags": ["pytest", "pygame"]}
+{"ts": 1777003406.9198663, "phase": "validate", "rounds": 1, "n_files": 13, "tags": ["pytest", "pygame"]}
+{"ts": 1777003817.129344, "phase": "plan", "rounds": 2, "n_files": 6, "tags": ["typescript", "jest"]}
+{"ts": 1777003817.1293955, "phase": "deps", "rounds": 1, "n_files": 6, "tags": ["typescript", "jest"]}
+{"ts": 1777003817.1294308, "phase": "scaffold", "rounds": 6, "n_files": 6, "tags": ["typescript", "jest"]}
+{"ts": 1777003817.1294608, "phase": "review", "rounds": 6, "n_files": 6, "tags": ["typescript", "jest"]}
+{"ts": 1777003817.1294885, "phase": "build", "rounds": 50, "n_files": 6, "tags": ["typescript", "jest"]}
+{"ts": 1777003817.129515, "phase": "integrate", "rounds": 5, "n_files": 6, "tags": ["typescript", "jest"]}
+{"ts": 1777005300.501534, "phase": "plan", "rounds": 2, "n_files": 10, "tags": ["pytest", "flask", "sqlite"]}
+{"ts": 1777005300.5015943, "phase": "deps", "rounds": 1, "n_files": 10, "tags": ["pytest", "flask", "sqlite"]}
+{"ts": 1777005300.5016239, "phase": "scaffold", "rounds": 10, "n_files": 10, "tags": ["pytest", "flask", "sqlite"]}
+{"ts": 1777005300.5016475, "phase": "build", "rounds": 35, "n_files": 10, "tags": ["pytest", "flask", "sqlite"]}
+{"ts": 1777005300.5016685, "phase": "review", "rounds": 6, "n_files": 10, "tags": ["pytest", "flask", "sqlite"]}
+{"ts": 1777005674.8504612, "phase": "plan", "rounds": 2, "n_files": 1, "tags": ["flask", "pytest", "sqlite"]}
+{"ts": 1777005674.8505182, "phase": "deps", "rounds": 1, "n_files": 1, "tags": ["flask", "pytest", "sqlite"]}
+{"ts": 1777005674.8505473, "phase": "scaffold", "rounds": 1, "n_files": 1, "tags": ["flask", "pytest", "sqlite"]}
+{"ts": 1777009282.4506657, "phase": "plan", "rounds": 2, "n_files": 111, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777009282.4506993, "phase": "deps", "rounds": 2, "n_files": 111, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777009282.4507215, "phase": "scaffold", "rounds": 15, "n_files": 111, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777009282.4507399, "phase": "review", "rounds": 6, "n_files": 111, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777009282.450757, "phase": "build", "rounds": 281, "n_files": 111, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777009282.4507742, "phase": "integrate", "rounds": 2, "n_files": 111, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777011972.9264128, "phase": "plan", "rounds": 2, "n_files": 19, "tags": ["flask", "vitest", "sqlite", "react", "pytest"]}
+{"ts": 1777011972.9264934, "phase": "deps", "rounds": 1, "n_files": 19, "tags": ["flask", "vitest", "sqlite", "react", "pytest"]}
+{"ts": 1777011972.926523, "phase": "scaffold", "rounds": 14, "n_files": 19, "tags": ["flask", "vitest", "sqlite", "react", "pytest"]}
+{"ts": 1777011972.926548, "phase": "review", "rounds": 6, "n_files": 19, "tags": ["flask", "vitest", "sqlite", "react", "pytest"]}
+{"ts": 1777011972.9265828, "phase": "build", "rounds": 117, "n_files": 19, "tags": ["flask", "vitest", "sqlite", "react", "pytest"]}
+{"ts": 1777011972.9266055, "phase": "integrate", "rounds": 3, "n_files": 19, "tags": ["flask", "vitest", "sqlite", "react", "pytest"]}
+{"ts": 1777013151.034171, "phase": "plan", "rounds": 2, "n_files": 25, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777013151.0342324, "phase": "deps", "rounds": 2, "n_files": 25, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777013151.0342624, "phase": "scaffold", "rounds": 14, "n_files": 25, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777013151.0342865, "phase": "build", "rounds": 87, "n_files": 25, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777013151.0343087, "phase": "integrate", "rounds": 21, "n_files": 25, "tags": ["sqlite", "flask", "react", "vitest", "pytest"]}
+{"ts": 1777014270.5682418, "phase": "plan", "rounds": 2, "n_files": 30, "tags": ["vitest", "sqlite", "pytest", "flask", "react"]}
+{"ts": 1777014270.5683174, "phase": "deps", "rounds": 1, "n_files": 30, "tags": ["vitest", "sqlite", "pytest", "flask", "react"]}
+{"ts": 1777014270.5683558, "phase": "scaffold", "rounds": 21, "n_files": 30, "tags": ["vitest", "sqlite", "pytest", "flask", "react"]}
+{"ts": 1777014270.5683863, "phase": "review", "rounds": 6, "n_files": 30, "tags": ["vitest", "sqlite", "pytest", "flask", "react"]}
+{"ts": 1777014270.5684152, "phase": "build", "rounds": 78, "n_files": 30, "tags": ["vitest", "sqlite", "pytest", "flask", "react"]}
+{"ts": 1777014270.5684435, "phase": "integrate", "rounds": 1, "n_files": 30, "tags": ["vitest", "sqlite", "pytest", "flask", "react"]}
+{"ts": 1777015374.0072591, "phase": "plan", "rounds": 2, "n_files": 31, "tags": ["react", "sqlite", "vitest", "flask", "pytest"]}
+{"ts": 1777015374.0073502, "phase": "deps", "rounds": 1, "n_files": 31, "tags": ["react", "sqlite", "vitest", "flask", "pytest"]}
+{"ts": 1777015374.0073948, "phase": "scaffold", "rounds": 18, "n_files": 31, "tags": ["react", "sqlite", "vitest", "flask", "pytest"]}
+{"ts": 1777015374.0074325, "phase": "build", "rounds": 77, "n_files": 31, "tags": ["react", "sqlite", "vitest", "flask", "pytest"]}
+{"ts": 1777015374.0074732, "phase": "integrate", "rounds": 50, "n_files": 31, "tags": ["react", "sqlite", "vitest", "flask", "pytest"]}
+{"ts": 1777017037.6281438, "phase": "plan", "rounds": 2, "n_files": 33, "tags": ["pytest", "react", "flask", "vitest", "sqlite"]}
+{"ts": 1777017037.6282127, "phase": "deps", "rounds": 1, "n_files": 33, "tags": ["pytest", "react", "flask", "vitest", "sqlite"]}
+{"ts": 1777017037.6282432, "phase": "scaffold", "rounds": 19, "n_files": 33, "tags": ["pytest", "react", "flask", "vitest", "sqlite"]}
+{"ts": 1777017037.6282668, "phase": "build", "rounds": 120, "n_files": 33, "tags": ["pytest", "react", "flask", "vitest", "sqlite"]}
+{"ts": 1777017037.6282887, "phase": "integrate", "rounds": 61, "n_files": 33, "tags": ["pytest", "react", "flask", "vitest", "sqlite"]}
+{"ts": 1777042863.660926, "phase": "plan", "rounds": 2, "n_files": 31, "tags": ["pytest", "react", "sqlite", "flask", "vitest"]}
+{"ts": 1777042863.660995, "phase": "deps", "rounds": 1, "n_files": 31, "tags": ["pytest", "react", "sqlite", "flask", "vitest"]}
+{"ts": 1777042863.6610334, "phase": "scaffold", "rounds": 21, "n_files": 31, "tags": ["pytest", "react", "sqlite", "flask", "vitest"]}
+{"ts": 1777042863.6610928, "phase": "build", "rounds": 140, "n_files": 31, "tags": ["pytest", "react", "sqlite", "flask", "vitest"]}
+{"ts": 1777042863.6611266, "phase": "integrate", "rounds": 74, "n_files": 31, "tags": ["pytest", "react", "sqlite", "flask", "vitest"]}
+{"ts": 1777043876.099502, "phase": "plan", "rounds": 2, "n_files": 13, "tags": ["pytest", "react", "vitest", "flask", "sqlite"]}
+{"ts": 1777043876.0995753, "phase": "deps", "rounds": 1, "n_files": 13, "tags": ["pytest", "react", "vitest", "flask", "sqlite"]}
+{"ts": 1777043876.099619, "phase": "scaffold", "rounds": 12, "n_files": 13, "tags": ["pytest", "react", "vitest", "flask", "sqlite"]}
+{"ts": 1777043876.0996652, "phase": "review", "rounds": 6, "n_files": 13, "tags": ["pytest", "react", "vitest", "flask", "sqlite"]}
+{"ts": 1777043876.0996928, "phase": "build", "rounds": 61, "n_files": 13, "tags": ["pytest", "react", "vitest", "flask", "sqlite"]}
+{"ts": 1777043876.099718, "phase": "integrate", "rounds": 3, "n_files": 13, "tags": ["pytest", "react", "vitest", "flask", "sqlite"]}
+{"ts": 1777045161.0633633, "phase": "plan", "rounds": 2, "n_files": 23, "tags": ["react", "pytest", "sqlite", "flask", "vitest"]}
+{"ts": 1777045161.0634227, "phase": "deps", "rounds": 2, "n_files": 23, "tags": ["react", "pytest", "sqlite", "flask", "vitest"]}
+{"ts": 1777045161.0634518, "phase": "scaffold", "rounds": 22, "n_files": 23, "tags": ["react", "pytest", "sqlite", "flask", "vitest"]}
+{"ts": 1777045161.0634747, "phase": "review", "rounds": 6, "n_files": 23, "tags": ["react", "pytest", "sqlite", "flask", "vitest"]}
+{"ts": 1777045161.0634959, "phase": "build", "rounds": 63, "n_files": 23, "tags": ["react", "pytest", "sqlite", "flask", "vitest"]}
+{"ts": 1777052119.991807, "phase": "plan", "rounds": 4, "n_files": 38, "tags": ["vitest", "flask", "pytest", "react", "sqlite"]}
+{"ts": 1777052119.991861, "phase": "deps", "rounds": 2, "n_files": 38, "tags": ["vitest", "flask", "pytest", "react", "sqlite"]}
+{"ts": 1777052119.9918966, "phase": "scaffold", "rounds": 29, "n_files": 38, "tags": ["vitest", "flask", "pytest", "react", "sqlite"]}
+{"ts": 1777052119.9919267, "phase": "build", "rounds": 506, "n_files": 38, "tags": ["vitest", "flask", "pytest", "react", "sqlite"]}
+{"ts": 1777052119.9919548, "phase": "review", "rounds": 6, "n_files": 38, "tags": ["vitest", "flask", "pytest", "react", "sqlite"]}
+{"ts": 1777052119.991982, "phase": "integrate", "rounds": 94, "n_files": 38, "tags": ["vitest", "flask", "pytest", "react", "sqlite"]}
