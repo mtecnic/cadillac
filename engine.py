@@ -4470,7 +4470,8 @@ def enhance(
         emit("log", msg=f"  [{status}] {r.name}")
 
     failures = format_failures(results)
-    if not failures:
+    all_pass = not failures
+    if all_pass:
         emit("info", msg="[ENHANCE] All validations pass!")
     else:
         emit("log", msg=f"[ENHANCE] {len([r for r in results if not r.passed])} validation(s) failed")
