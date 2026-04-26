@@ -971,8 +971,11 @@ def detect_model(cfg: Config) -> str:
     return data[0]["id"]
 
 
-def estimate_tokens(text: str) -> int:
-    return len(text) // 4
+def estimate_tokens(text: str | None) -> int:
+    # Tolerate None — assistant messages with only tool_calls have
+    # content == None (explicit null), and `dict.get("content", "")` only
+    # returns the default for MISSING keys, not for explicit None values.
+    return len(text) // 4 if text else 0
 
 
 def estimate_messages_tokens(messages: list[dict]) -> int:
