@@ -2960,5 +2960,75 @@ class TestWriteNodeBoilerplateFiltersPython(unittest.TestCase):
             self.assertNotIn("type", pkg)
 
 
+class TestShouldUseModular(unittest.TestCase):
+    """Improved heuristic — modular for eBay-scale full-stack, flat for tiny CLIs.
+
+    Prod regression: eBay-scale auction site (25+ files, full-stack
+    Python+TS, clean module boundaries) was silently going flat because
+    the old heuristic only counted `.py` refs and missed the obvious
+    full-stack split.
+    """
+
+    def test_simple_cli_stays_flat(self):
+        from cadillac.engine import _should_use_modular
+        arch = "## Architecture\nSimple CLI: main.py, ops.py, cli.py.\n"
+        self.assertFalse(_should_use_modular(arch))
+
+    def test_explicit_modules_section_triggers(self):
+        from cadillac.engine import _should_use_modular
+        arch = "## Architecture\nstuff\n\n## Modules\n- a: x\n- b: y\n"
+        self.assertTrue(_should_use_modular(arch))
+
+    def test_full_stack_split_triggers_even_with_few_files(self):
+        # eBay-style: backend + frontend mentioned together → modular
+        from cadillac.engine import _should_use_modular
+        arch = ("## Architecture\nApp split: backend/ for API, "
+                "frontend/ for React. Just a few files.\n")
+        self.assertTrue(_should_use_modular(arch))
+
+    def test_many_source_files_across_languages_triggers(self):
+        # Old heuristic only counted .py — modern apps have .tsx/.ts/.jsx too
+        from cadillac.engine import _should_use_modular
+        arch = "\n".join(
+            f"file{i}.tsx → does X" for i in range(20)
+        )
+        self.assertTrue(_should_use_modular(arch))
+
+    def test_four_subdirs_enumerated_triggers(self):
+        from cadillac.engine import _should_use_modular
+        arch = ("## Architecture\nDirectory layout: auth/, listings/, "
+                "bids/, orders/, reviews/, watchlist/")
+        self.assertTrue(_should_use_modular(arch))
+
+    def test_common_path_words_dont_count_as_modules(self):
+        # `tests/`, `src/`, `node_modules/` shouldn't push us to modular
+        from cadillac.engine import _should_use_modular
+        arch = ("## Architecture\nSimple project: src/ has main.py, "
+                "tests/ has tests, lib/ has helpers, public/ has assets.")
+        self.assertFalse(_should_use_modular(arch))
+
+    def test_ebay_architecture_triggers(self):
+        # End-to-end: the actual eBay architecture text format that
+        # previously went flat must now trigger modular.
+        from cadillac.engine import _should_use_modular
+        arch = """# eBay-Scale Auction Marketplace — Architecture Document
+
+## Architecture
+- Backend: Modular blueprints (auth, listings, bids, watchlist, reviews, orders)
+- Frontend: Pages, components, hooks, services
+- File Organization:
+  - Backend: backend/{app.py,models.py,utils/}, auth/, listings/, bids/, watchlist/, reviews/, orders/
+  - Frontend: frontend/src/{main.tsx,App.tsx,pages/,components/,services/,hooks/,types/}
+
+## Interfaces
+- backend/models.py: User
+- backend/bids/service.py: validate_bid
+- frontend/src/services/api.ts: postBid
+- frontend/src/components/BidForm.tsx: BidForm
+"""
+        self.assertTrue(_should_use_modular(arch),
+                        msg="full-stack eBay arch should trigger modular pipeline")
+
+
 if __name__ == "__main__":
     unittest.main()
