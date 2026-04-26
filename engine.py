@@ -1803,11 +1803,61 @@ def _format_critic_findings(findings: list[dict]) -> str:
 
 
 def _should_use_modular(architecture_text: str) -> bool:
-    """Detect if a project should use modular build based on architecture text."""
-    file_refs = len(re.findall(r'\w+\.py', architecture_text))
-    has_modules = any(w in architecture_text.lower()
-                      for w in ["## modules"])
-    return file_refs >= 15 or has_modules
+    """Decide flat vs modular pipeline from the architecture text.
+
+    Modular pipeline kicks in for any of these strong signals:
+      1. >=15 source-file references (Python, TS/JS, Vue, Svelte, Go, Rust)
+      2. Explicit "## Modules" heading in the architecture
+      3. Full-stack split: both `backend/` AND `frontend/` (or `client/server`,
+         `api/web`) referenced — natural module boundary
+      4. >=4 distinct top-level subdirectory mentions enumerated as
+         components (e.g. `auth/, listings/, bids/, orders/`) — that's a
+         module list whether the LLM labeled it as such or not
+
+    Old heuristic counted only `.py` refs, so a 25-file full-stack project
+    with mostly `.tsx` files (eBay-style) would silently fall back to flat
+    despite obvious module boundaries.
+    """
+    text = architecture_text
+    text_lower = text.lower()
+
+    # 1. Count source files across every common language
+    file_refs = len(re.findall(
+        r"\w+\.(?:py|ts|tsx|js|jsx|vue|svelte|go|rs|java|kt|cs)\b",
+        text,
+    ))
+    if file_refs >= 15:
+        return True
+
+    # 2. Explicit modules section
+    if "## modules" in text_lower:
+        return True
+
+    # 3. Full-stack split — strong signal regardless of file count
+    backend_signals = ("backend/", "server/", "api/")
+    frontend_signals = ("frontend/", "client/", "web/", "ui/")
+    has_backend = any(s in text_lower for s in backend_signals)
+    has_frontend = any(s in text_lower for s in frontend_signals)
+    if has_backend and has_frontend:
+        return True
+
+    # 4. >=4 distinct subdirectory components enumerated. Looks for the
+    # classic comma/slash-separated list pattern: `auth/, listings/, bids/`
+    # or `auth/, listings/, bids/, orders/, reviews/`.
+    subdir_matches = re.findall(r"\b([a-z][a-z_]{1,15})/", text_lower)
+    distinct_subdirs = {
+        s for s in subdir_matches
+        # Exclude common path-suffix words that aren't module names
+        if s not in {
+            "src", "tests", "test", "lib", "bin", "etc", "var", "usr",
+            "node_modules", "dist", "build", "public", "static", "assets",
+            "docs", "examples", "scripts",
+        }
+    }
+    if len(distinct_subdirs) >= 4:
+        return True
+
+    return False
 
 
 def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
