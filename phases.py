@@ -12,11 +12,12 @@ class Phase(Enum):
     REVIEW = "review"
     BUILD = "build"
     INTEGRATE = "integrate"
+    WIRING = "wiring"
     VALIDATE = "validate"
     PACKAGE = "package"
 
 
-PHASE_ORDER = [Phase.PLAN, Phase.DEPS, Phase.SCAFFOLD, Phase.REVIEW, Phase.BUILD, Phase.INTEGRATE, Phase.VALIDATE, Phase.PACKAGE]
+PHASE_ORDER = [Phase.PLAN, Phase.DEPS, Phase.SCAFFOLD, Phase.REVIEW, Phase.BUILD, Phase.INTEGRATE, Phase.WIRING, Phase.VALIDATE, Phase.PACKAGE]
 
 # Default round budgets per phase
 DEFAULT_BUDGETS = {
@@ -27,6 +28,7 @@ DEFAULT_BUDGETS = {
     Phase.REVIEW: 6,  # Adversarial critic: needs rounds to read files + trace flows + produce findings
     Phase.BUILD: 30,
     Phase.INTEGRATE: 0,  # non-modular builds skip; modular gets 20
+    Phase.WIRING: 4,  # Cross-layer HTTP smoke: boot servers + curl with non-loopback Origin
     Phase.VALIDATE: 10,
     Phase.PACKAGE: 5,
 }
@@ -160,6 +162,7 @@ def compute_budgets(plan: dict, task_text: str = "") -> dict:
         Phase.REVIEW: 6,
         Phase.BUILD: max(20, n_files * 4) + build_bump,
         Phase.INTEGRATE: (20 + max(0, n_modules - 3) * 5) if is_modular else 0,
+        Phase.WIRING: 4,
         Phase.VALIDATE: 10,
         Phase.PACKAGE: 5,
     }

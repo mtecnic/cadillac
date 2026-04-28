@@ -449,7 +449,28 @@ The JSON must have this structure:
   "constraints": [
     "MUST use vitest (task explicitly says NOT jest)",
     "MUST NOT use global mutable state for game sessions"
-  ]
+  ],
+  "contracts": {{{{
+    "_comment": "REQUIRED if any module makes HTTP calls to another module (frontend↔backend, microservices). Omit entirely for single-language CLIs/libraries/games.",
+    "endpoints": [
+      {{{{
+        "name": "register",
+        "method": "POST",
+        "path": "/api/auth/register",
+        "module": "auth",
+        "consumed_by": ["pages"],
+        "request": {{{{"username": "string", "email": "string", "password": "string"}}}},
+        "response": {{{{
+          "201": {{{{"message": "string", "user": "User"}}}},
+          "400": {{{{"errors": "array<string>"}}}},
+          "409": {{{{"error": "string"}}}}
+        }}}}
+      }}}}
+    ],
+    "types": {{{{
+      "User": {{{{"id": "integer", "username": "string", "email": "string"}}}}
+    }}}}
+  }}}}
 }}}}
 
 Rules:
@@ -464,6 +485,7 @@ Rules:
 - "entry_point": must accept --test flag per the test plan
 - "test_file": integration test file at project root
 - "constraints": short list of EXPLICIT musts/must-nots from the task text. Examples: "MUST use vitest not jest", "MUST return 400 on invalid input", "MUST NOT use top-level await". Empty list if task has no explicit constraints.
+- "contracts": include ONLY when modules talk to each other over HTTP (frontend↔backend, multi-service). One source of truth for endpoints both sides agree on. For each endpoint declare: name, method, path, module (which module owns the implementation), consumed_by (which modules call it), request (body field types), response (status_code → shape). For shared shapes referenced by multiple endpoints, declare them in `types`. **The frontend module MUST consume EXACTLY this shape; the backend module MUST return EXACTLY this shape.** If a backend route accepts `username/email/password`, the contract says so and the frontend sends the same. Mismatched fields are a build failure. OMIT this key entirely for single-language projects (CLIs, games, libraries).
 - Output ONLY the JSON object.
 
 {lessons}"""
