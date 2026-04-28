@@ -1460,6 +1460,745 @@ def check_framework_conflicts(
     return [CheckResult("framework", True)]
 
 
+# --------------------------------------------------------------------------- #
+#  WIRING — cross-layer HTTP smoke (Phase 1 of architecture upgrade)          #
+# --------------------------------------------------------------------------- #
+
+def _wiring_detect_backend(workspace: str) -> dict | None:
+    """Find a Python HTTP backend entry point. Returns {entry, framework, port, cmd} or None.
+
+    Looks for Flask/FastAPI in the usual entry-point spots. The entry file
+    itself may not import Flask directly (application-factory pattern); in
+    that case we fall back to scanning the project for any Flask/FastAPI
+    import — if one exists and the entry runs an HTTP server, it counts.
+    Skips projects that are pure CLIs, games, libraries, or static sites.
+    """
+    candidates = [
+        "backend/app.py", "backend/main.py", "backend/server.py",
+        "app.py", "server.py", "main.py", "src/main.py",
+    ]
+
+    def _find_framework(text: str) -> str | None:
+        if "from flask" in text or "import flask" in text or "Flask(" in text:
+            return "flask"
+        if "FastAPI" in text or "from fastapi" in text:
+            return "fastapi"
+        return None
+
+    def _project_has(framework: str) -> bool:
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [d for d in dirs if d not in (
+                "node_modules", "frontend", ".git", "__pycache__",
+                "dist", "build", "venv", ".venv", ".cadillac")]
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(root, fn)) as f:
+                        if _find_framework(f.read()) == framework:
+                            return True
+                except Exception:
+                    pass
+        return False
+
+    for rel in candidates:
+        path = os.path.join(workspace, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                text = f.read()
+        except Exception:
+            continue
+        framework = _find_framework(text)
+        # Application-factory pattern: entry delegates to create_app() /
+        # similar without importing Flask directly. If the entry looks like
+        # a server launcher (calls create_app, app.run, has app.run-style
+        # shape, or pulls in something from a .api/.server submodule) and
+        # the project has Flask imports somewhere, count it.
+        if framework is None:
+            looks_like_launcher = bool(re.search(
+                r"\b(create_app|app\.run|run_simple|uvicorn\.run|"
+                r"from\s+\w+\.(api|server|app)\b|from\s+backend\b)", text,
+            ))
+            if looks_like_launcher:
+                if _project_has("flask"):
+                    framework = "flask"
+                elif _project_has("fastapi"):
+                    framework = "fastapi"
+        if framework is None:
+            continue
+        port = 5000 if framework == "flask" else 8000
+        # Try, in priority order: (1) explicit `port=NNNN` kwarg, (2) env var
+        # default `os.environ.get("PORT", "NNNN")`, (3) bare `PORT = NNNN`.
+        for pat in (
+            r'\bport\s*=\s*(\d{4,5})\b',
+            r'os\.environ\.get\(\s*["\']PORT["\']\s*,\s*["\']?(\d{4,5})',
+            r'\bPORT\s*=\s*["\']?(\d{4,5})',
+        ):
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                try:
+                    port = int(m.group(1))
+                    break
+                except Exception:
+                    pass
+        return {"entry": rel, "framework": framework, "port": port,
+                "cmd": ["python3", rel]}
+    return None
+
+
+def _wiring_detect_frontend(workspace: str) -> dict | None:
+    """Find a JS frontend dir with React/Vue/Vite. Returns {dir, deps} or None."""
+    for d in ["frontend", "client", "web", "ui", "."]:
+        full = os.path.join(workspace, d)
+        pkg_path = os.path.join(full, "package.json")
+        if not os.path.isfile(pkg_path):
+            continue
+        try:
+            with open(pkg_path) as f:
+                pkg = json.load(f)
+        except Exception:
+            continue
+        deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+        marker_keys = {"react", "vue", "@angular/core", "vite", "svelte", "next"}
+        if marker_keys.intersection(deps.keys()):
+            return {"dir": full, "deps": list(deps.keys())}
+    return None
+
+
+def _wiring_check_no_localhost_hardcode(workspace: str, fe: dict) -> list[CheckResult]:
+    """Flag hardcoded `http://localhost:NNNN` in the frontend client.
+
+    Such URLs only resolve from the build machine itself. As soon as the dev
+    server is opened from a LAN address, codespaces URL, or any non-loopback
+    host, every request to that URL fails with ERR_CONNECTION_REFUSED.
+    """
+    src_dir = os.path.join(fe["dir"], "src")
+    if not os.path.isdir(src_dir):
+        src_dir = fe["dir"]
+
+    offenders: list[tuple[str, int, str]] = []
+    for root, _, files in os.walk(src_dir):
+        if "node_modules" in root or "__mocks__" in root or "dist" in root:
+            continue
+        for fn in files:
+            if not fn.endswith((".ts", ".tsx", ".js", ".jsx")):
+                continue
+            if ".test." in fn or ".spec." in fn:
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except Exception:
+                continue
+            for m in re.finditer(r'["\'](https?://localhost(?::\d+)?(?:/[^"\']*)?)["\']', text):
+                line_no = text[:m.start()].count("\n") + 1
+                offenders.append((os.path.relpath(path, workspace), line_no, m.group(1)))
+
+    if offenders:
+        msg = ("Hardcoded localhost URL in client code — breaks for non-loopback users.\n"
+               "Derive from `window.location.hostname` (or read `import.meta.env.VITE_API_BASE_URL`):\n")
+        for p, ln, url in offenders[:5]:
+            msg += f"  {p}:{ln} → {url}\n"
+        return [CheckResult("wiring", False, msg.rstrip(), severity="error")]
+    return [CheckResult("wiring", True, "no hardcoded localhost in client", severity="info")]
+
+
+def _wiring_find_free_port(default: int = 5000) -> int:
+    import socket
+    for p in (default, default + 1, default + 2, default + 3, 0):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", p))
+            picked = s.getsockname()[1]
+            return picked
+        except OSError:
+            continue
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return default
+
+
+def _wiring_discover_post_routes(workspace: str) -> list[str]:
+    """Scan Flask blueprint route decorators to enumerate POST endpoints.
+
+    Resolves blueprint url_prefix per file (declarations in the same file as
+    the routes). Skips routes with `<param>` placeholders we can't fill.
+    """
+    routes: list[str] = []
+    seen: set[str] = set()
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs
+                   if d not in ("node_modules", "frontend", ".git",
+                                "__pycache__", "dist", "build", "venv", ".venv")]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except Exception:
+                continue
+            prefixes: dict[str, str] = {}
+            for m in re.finditer(
+                r'(\w+)\s*=\s*Blueprint\([^)]*url_prefix\s*=\s*["\']([^"\']+)["\']',
+                text,
+            ):
+                prefixes[m.group(1)] = m.group(2)
+            for m in re.finditer(
+                r'@(\w+)\.route\(\s*["\']([^"\']+)["\'][^)]*methods\s*=\s*\[([^\]]+)\]',
+                text,
+            ):
+                obj, route, methods_str = m.group(1), m.group(2), m.group(3)
+                if "POST" not in methods_str.upper():
+                    continue
+                full = prefixes.get(obj, "") + route
+                if "<" in full:
+                    continue
+                if full not in seen:
+                    seen.add(full)
+                    routes.append(full)
+    return routes
+
+
+def _wiring_dynamic_checks(workspace: str, be: dict) -> list[CheckResult]:
+    """Boot the backend and exercise it from a synthetic non-loopback Origin."""
+    import socket
+    import time
+    import urllib.error
+    import urllib.request
+
+    port = _wiring_find_free_port(default=be.get("port", 5000))
+    synthetic_origin = "http://lan.test:5173"
+
+    env = os.environ.copy()
+    env["PORT"] = str(port)
+    # Development-mode boot: matches how a dev would run it. Production-mode
+    # config (DB URLs, secret keys) is checked separately, not here.
+    env["FLASK_ENV"] = "development"
+    env["FLASK_DEBUG"] = "0"  # in case the app reads this directly
+    env["CORS_ORIGINS"] = f"{synthetic_origin},http://localhost:5173"
+    # Workspace root on PYTHONPATH so application-factory entries that do
+    # `from backend.api.app import create_app` resolve. Without this, every
+    # such build fails to launch even though its code is correct. We surface
+    # this as a hint in the result message rather than blocking the whole
+    # check on a launcher-bootstrap quirk.
+    env["PYTHONPATH"] = workspace + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+    try:
+        # New session/process group so terminate cleanly kills any child the
+        # Flask debug reloader might fork off.
+        proc = subprocess.Popen(
+            be["cmd"], cwd=workspace, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return [CheckResult("wiring", False, f"failed to launch backend: {e}", severity="error")]
+
+    try:
+        deadline = time.time() + 12
+        listening = False
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    listening = True
+                    break
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.25)
+            if proc.poll() is not None:
+                tail = proc.stdout.read() if proc.stdout else ""
+                return [CheckResult(
+                    "wiring", False,
+                    f"backend exited before listening on :{port} (exit={proc.returncode})\n"
+                    f"{tail[-1500:]}",
+                    severity="error",
+                )]
+
+        if not listening:
+            return [CheckResult(
+                "wiring", False,
+                f"backend never bound to :{port} within 12s — startup may be hanging",
+                severity="error",
+            )]
+
+        results: list[CheckResult] = []
+
+        # Probe 1a: GET / and GET /health (best-effort, may not exist)
+        for path in ("/", "/health", "/api/health"):
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET")
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            except Exception:
+                continue
+            if 500 <= code < 600:
+                results.append(CheckResult(
+                    "wiring", False,
+                    f"GET {path} returned {code} — backend crashes on root probe",
+                    severity="error",
+                ))
+
+        # Probe 1b: GET endpoints from the contract (parameterless ones).
+        # Hardcoded `/health`-style probes only catch crashes on routes the
+        # app declares; contract endpoints are the routes the app PROMISED.
+        # Probe each — non-5xx is acceptable (200/401/404 are all real
+        # responses, not server crashes). Skip endpoints with `<param>`
+        # placeholders (we can't synthesize realistic IDs).
+        try:
+            from .contracts import Contract
+            contract = Contract.load(workspace)
+        except Exception:
+            contract = None
+        contract_5xx: list[str] = []
+        if contract is not None and not contract.is_empty():
+            for ep in contract.endpoints:
+                if ep.method != "GET":
+                    continue  # only GET is safe to probe (no side effects)
+                if "<" in ep.path or "{" in ep.path or ":" in ep.path.lstrip("/"):
+                    continue  # has path params we can't fill
+                try:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}{ep.path}", method="GET",
+                        headers={"Origin": synthetic_origin},
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        code = r.status
+                except urllib.error.HTTPError as e:
+                    code = e.code
+                except Exception:
+                    continue
+                if 500 <= code < 600:
+                    contract_5xx.append(f"GET {ep.path} → {code}")
+        if contract_5xx:
+            results.append(CheckResult(
+                "wiring", False,
+                "Contract GET endpoints crashed (5xx). The route exists but "
+                "the handler raises at runtime — likely a thread-safety, "
+                "config, or initialization bug invisible to the test suite:\n  "
+                + "\n  ".join(contract_5xx),
+                severity="error",
+            ))
+
+        # Probe 2: CORS echoes synthetic origin from after_request handler
+        cors_ok = False
+        cors_msg = ""
+        for path in ("/health", "/", "/api/health"):
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    method="OPTIONS",
+                    headers={
+                        "Origin": synthetic_origin,
+                        "Access-Control-Request-Method": "GET",
+                        "Access-Control-Request-Headers": "content-type",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    allow = r.headers.get("Access-Control-Allow-Origin", "")
+                    if allow in (synthetic_origin, "*"):
+                        cors_ok = True
+                        break
+                    cors_msg = f"OPTIONS {path}: Access-Control-Allow-Origin='{allow}'"
+            except urllib.error.HTTPError as e:
+                allow = e.headers.get("Access-Control-Allow-Origin", "")
+                if allow in (synthetic_origin, "*"):
+                    cors_ok = True
+                    break
+                cors_msg = f"OPTIONS {path} → {e.code}, no CORS echo"
+            except Exception as e:
+                cors_msg = f"OPTIONS {path}: {e}"
+        if not cors_ok:
+            results.append(CheckResult(
+                "wiring", False,
+                "CORS preflight from a non-loopback Origin (http://lan.test:5173) did not "
+                f"echo the origin. {cors_msg}\n"
+                "Fix: ensure the @after_request handler reads CORS_ORIGINS from os.environ "
+                "(not just app.config), and that the env var is loaded.",
+                severity="error",
+            ))
+
+        # Probe 3: every discovered POST route should return 4xx, not 5xx, on empty payload
+        post_routes = _wiring_discover_post_routes(workspace)
+        five_xx_routes: list[str] = []
+        for route in post_routes[:15]:
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{route}",
+                    data=b"{}",
+                    method="POST",
+                    headers={"Content-Type": "application/json",
+                             "Origin": synthetic_origin},
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            except Exception:
+                continue
+            if 500 <= code < 600:
+                five_xx_routes.append(f"POST {route} → {code}")
+        if five_xx_routes:
+            results.append(CheckResult(
+                "wiring", False,
+                "Routes returned 5xx on empty payload (validation should reject with 4xx, "
+                "not raise inside the handler):\n  " + "\n  ".join(five_xx_routes),
+                severity="error",
+            ))
+
+        if not results:
+            return [CheckResult(
+                "wiring", True,
+                f"backend boots, CORS echoes non-loopback Origin, "
+                f"{len(post_routes)} POST route(s) return non-5xx on empty body",
+                severity="info",
+            )]
+        return results
+    finally:
+        # Kill the whole process group so any reloader-forked children die too.
+        import signal as _signal
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+# --------------------------------------------------------------------------- #
+#  CONTRACT ALIGNMENT — verify backend implements + frontend consumes the     #
+#  contract. (Phase 2 of architecture upgrade.)                               #
+# --------------------------------------------------------------------------- #
+
+def _contract_collect_backend_routes(workspace: str) -> list[tuple[str, str, str]]:
+    """Return [(method, full_path, file:line)] for every Flask/FastAPI route."""
+    routes: list[tuple[str, str, str]] = []
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs
+                   if d not in ("node_modules", "frontend", ".git",
+                                "__pycache__", "dist", "build", "venv", ".venv")]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except Exception:
+                continue
+            prefixes: dict[str, str] = {}
+            for m in re.finditer(
+                r'(\w+)\s*=\s*Blueprint\([^)]*url_prefix\s*=\s*["\']([^"\']+)["\']',
+                text,
+            ):
+                prefixes[m.group(1)] = m.group(2)
+            # Flask: @bp.route(path, methods=[...])
+            for m in re.finditer(
+                r'@(\w+)\.route\(\s*["\']([^"\']+)["\'][^)]*methods\s*=\s*\[([^\]]+)\]',
+                text,
+            ):
+                obj, route, methods_str = m.group(1), m.group(2), m.group(3)
+                full = prefixes.get(obj, "") + route
+                line_no = text[:m.start()].count("\n") + 1
+                for meth in re.findall(r'["\'](\w+)["\']', methods_str):
+                    routes.append((meth.upper(), full,
+                                   f"{os.path.relpath(path, workspace)}:{line_no}"))
+            # FastAPI: @app.get/.post/.put/.delete/.patch(path)
+            for m in re.finditer(
+                r'@(\w+)\.(get|post|put|delete|patch)\(\s*["\']([^"\']+)["\']',
+                text,
+            ):
+                obj, meth, route = m.group(1), m.group(2), m.group(3)
+                full = prefixes.get(obj, "") + route
+                line_no = text[:m.start()].count("\n") + 1
+                routes.append((meth.upper(), full,
+                               f"{os.path.relpath(path, workspace)}:{line_no}"))
+    return routes
+
+
+def _contract_collect_frontend_calls(workspace: str) -> list[tuple[str, str, str]]:
+    """Return [(method, path, file:line)] for every axios/fetch service call."""
+    fe_dir = None
+    for d in ("frontend", "client", "web", "ui", "."):
+        if os.path.isdir(os.path.join(workspace, d, "src")):
+            fe_dir = os.path.join(workspace, d, "src")
+            break
+        if os.path.isfile(os.path.join(workspace, d, "package.json")):
+            fe_dir = os.path.join(workspace, d)
+            break
+    if not fe_dir or not os.path.isdir(fe_dir):
+        return []
+
+    calls: list[tuple[str, str, str]] = []
+    for root, dirs, files in os.walk(fe_dir):
+        if "node_modules" in root or "dist" in root or "build" in root:
+            continue
+        for fn in files:
+            if not fn.endswith((".ts", ".tsx", ".js", ".jsx")):
+                continue
+            if ".test." in fn or ".spec." in fn:
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except Exception:
+                continue
+            # axios pattern: matches any identifier ending in api/Api/Client/client
+            # plus the bare names (api, axios, http, client). Catches:
+            #   api.post(...), axios.get(...), apiClient.post(...),
+            #   bookmarksApi.delete(...), AuthClient.get(...)
+            # Tolerates TS generic type args: `.post<LoginResponse>('/url', ...)`
+            # and chained-call newlines: `apiClient\n    .post(...)`.
+            for m in re.finditer(
+                r'\b\w*(?:[Aa]pi|[Cc]lient|axios|http|fetch)\s*\.\s*(get|post|put|delete|patch)\s*(?:<[^>]*>\s*)?\(\s*[`"\']([^`"\']+)[`"\']',
+                text,
+                re.DOTALL,
+            ):
+                meth, route = m.group(1).upper(), m.group(2)
+                line_no = text[:m.start()].count("\n") + 1
+                calls.append((meth, route,
+                              f"{os.path.relpath(path, workspace)}:{line_no}"))
+            # fetch pattern: fetch('/api/...', { method: 'POST' })
+            for m in re.finditer(
+                r'fetch\s*\(\s*[`"\']([^`"\']+)[`"\'][^)]*method\s*:\s*[`"\'](\w+)[`"\']',
+                text,
+            ):
+                route, meth = m.group(1), m.group(2).upper()
+                line_no = text[:m.start()].count("\n") + 1
+                calls.append((meth, route,
+                              f"{os.path.relpath(path, workspace)}:{line_no}"))
+            # Helper-function pattern: `await get('/api/x')` /
+            # `post('/api/y', body)`. Frontend code commonly wraps fetch
+            # behind a verb-named helper; the route literal is at the helper
+            # call site, not the underlying fetch. Restricted to `/api/`-prefixed
+            # paths so we don't false-match on local-state getters like
+            # `get('user')`.
+            for m in re.finditer(
+                r'\b(get|post|put|delete|patch)\s*(?:<[^>]*>\s*)?\(\s*[`"\']\s*(/api/[^`"\']*)[`"\']',
+                text,
+            ):
+                meth, route = m.group(1).upper(), m.group(2)
+                line_no = text[:m.start()].count("\n") + 1
+                calls.append((meth, route,
+                              f"{os.path.relpath(path, workspace)}:{line_no}"))
+    return calls
+
+
+def _contract_norm_path(p: str) -> str:
+    """Collapse all path-param syntaxes to <param> for matching, strip query
+    strings, strip trailing slashes (Flask `strict_slashes=False` makes
+    `/x` and `/x/` equivalent at runtime; the contract should not have to
+    care)."""
+    # Drop query string — contract alignment is about routing, not params.
+    if "?" in p:
+        p = p.split("?", 1)[0]
+    # JS template-literal ${id} — must come BEFORE the bare {id} rule below
+    # or we'd convert `${id}` → `$<param>` (eating only the `{id}` part).
+    p = re.sub(r"\$\{[^}]+\}", "<param>", p)
+    # Flask <id>, <int:id>, <string:slug>
+    p = re.sub(r"<[^>]+>", "<param>", p)
+    # FastAPI / Express {id}
+    p = re.sub(r"\{[^}]+\}", "<param>", p)
+    # :id-style (Express)
+    p = re.sub(r":\w+", "<param>", p)
+    # Trailing slash (but keep root "/")
+    if len(p) > 1 and p.endswith("/"):
+        p = p[:-1]
+    return p
+
+
+def _contract_match(method: str, path: str,
+                    candidates: list[tuple[str, str, str]]) -> tuple[str, str, str] | None:
+    """Find a candidate (method, path, ref) matching the contract endpoint.
+
+    Frontend often calls without /api prefix because baseURL has it baked in,
+    so we also try matching with that prefix stripped from the contract.
+    """
+    norm_target = _contract_norm_path(path)
+    target_no_api = norm_target[4:] if norm_target.startswith("/api/") else norm_target
+    for cand_method, cand_path, ref in candidates:
+        if cand_method != method:
+            continue
+        cand_norm = _contract_norm_path(cand_path)
+        if cand_norm in (norm_target, target_no_api):
+            return cand_method, cand_path, ref
+        # Candidate may have its own /api prefix that contract doesn't
+        if cand_norm.startswith("/api/") and cand_norm[4:] == target_no_api:
+            return cand_method, cand_path, ref
+    return None
+
+
+def check_contract_alignment(workspace: str, lang=None) -> list[CheckResult]:
+    """For every contract endpoint, verify backend implements it AND (for
+    consumed_by entries) frontend has at least one matching service call.
+
+    No-op when the project has no `contracts.json` (single-language projects,
+    or modular projects where the LLM judged contracts unnecessary).
+    """
+    from .contracts import Contract
+
+    contract = Contract.load(workspace)
+    if contract.is_empty():
+        return [CheckResult("contract", True, "no contract present (single-layer project)",
+                            severity="info")]
+
+    backend_routes = _contract_collect_backend_routes(workspace)
+    frontend_calls = _contract_collect_frontend_calls(workspace)
+
+    missing_backend: list[str] = []
+    missing_frontend: list[str] = []
+
+    for ep in contract.endpoints:
+        be_match = _contract_match(ep.method, ep.path, backend_routes)
+        if not be_match:
+            missing_backend.append(
+                f"{ep.method} {ep.path} (module={ep.module}) — no backend route found"
+            )
+        if ep.consumed_by:
+            fe_match = _contract_match(ep.method, ep.path, frontend_calls)
+            if not fe_match:
+                missing_frontend.append(
+                    f"{ep.method} {ep.path} — declared consumed_by={ep.consumed_by} but no client call found"
+                )
+
+    results: list[CheckResult] = []
+    if missing_backend:
+        results.append(CheckResult(
+            "contract", False,
+            "Contract endpoints with no backend implementation:\n  " +
+            "\n  ".join(missing_backend),
+            severity="error",
+        ))
+    if missing_frontend:
+        results.append(CheckResult(
+            "contract", False,
+            "Contract endpoints declared consumed_by frontend but no client call found:\n  " +
+            "\n  ".join(missing_frontend),
+            severity="warning",
+        ))
+    if not results:
+        results.append(CheckResult(
+            "contract", True,
+            f"all {len(contract.endpoints)} contract endpoints have backend impls + frontend calls",
+            severity="info",
+        ))
+    return results
+
+
+# --------------------------------------------------------------------------- #
+#  TOPOLOGY — orchestrator-owned cross-module graph (Phase 3)                 #
+# --------------------------------------------------------------------------- #
+
+def check_topology(workspace: str, lang=None) -> list[CheckResult]:
+    """Run cross-module invariant checks via the Topology graph.
+
+    Catches bug classes the per-layer pipeline misses by definition: env-var
+    lookups with no load site, contract endpoints pointing at modules that
+    don't exist, port collisions across modules.
+
+    No-op for projects without enough structure to have a topology
+    (single-file scripts, single-module libraries with no env var reads).
+    """
+    from .topology import Topology
+
+    topo = Topology.build(workspace)
+    issues = topo.check()
+    if not issues:
+        # Don't emit a "passed" result when there's nothing to check — keeps
+        # the validation log uncluttered for small projects.
+        n_reads = len(topo.env_var_reads)
+        n_endpoints = len(topo.contract.endpoints)
+        if n_reads == 0 and n_endpoints == 0:
+            return [CheckResult("topology", True,
+                                "skipped — no env vars or contract endpoints to verify",
+                                severity="info")]
+        return [CheckResult(
+            "topology", True,
+            f"checked {n_reads} env var read(s), "
+            f"{n_endpoints} contract endpoint(s), "
+            f"{len(topo.port_bindings)} port binding(s)",
+            severity="info",
+        )]
+
+    by_severity: dict[str, list] = {"error": [], "warning": []}
+    for issue in issues:
+        by_severity.setdefault(issue.severity, []).append(issue)
+
+    results: list[CheckResult] = []
+    for severity, items in by_severity.items():
+        if not items:
+            continue
+        body_lines = []
+        for issue in items:
+            body_lines.append(f"[{issue.rule}] {issue.message}")
+            for ref in issue.refs[:3]:
+                body_lines.append(f"    at {ref}")
+        results.append(CheckResult(
+            "topology", False, "\n".join(body_lines), severity=severity,
+        ))
+    return results
+
+
+def check_wiring(workspace: str, lang=None) -> list[CheckResult]:
+    """Cross-layer HTTP smoke test — Phase 1 of the architecture upgrade.
+
+    For projects with both a Python HTTP backend and a JS frontend, boots the
+    backend on a free port and exercises it from a synthetic non-loopback
+    Origin. Catches three bug classes the static + per-layer pipeline misses:
+
+      - hardcoded `http://localhost:NNNN` in the frontend API client
+      - CORS allow-origin not echoing real (non-loopback) request origins
+      - backend routes that 500 on minimal/empty payloads
+
+    No-op for single-layer projects (CLI, library, game, static site).
+    """
+    be = _wiring_detect_backend(workspace)
+    fe = _wiring_detect_frontend(workspace)
+    if not be or not fe:
+        return [CheckResult("wiring", True,
+                            "skipped — single-layer project (no backend+frontend pair detected)",
+                            severity="info")]
+
+    results: list[CheckResult] = []
+    # Topology runs first — if env vars are unloaded or contract references
+    # phantom modules, the rest of the smoke is moot.
+    results.extend(check_topology(workspace, lang))
+    # Contract alignment: backend implements + frontend consumes the shapes.
+    results.extend(check_contract_alignment(workspace, lang))
+    # Static client-side hygiene before booting the server.
+    results.extend(_wiring_check_no_localhost_hardcode(workspace, fe))
+    # Dynamic boot + probe — only if the static checks above didn't already
+    # surface a structural issue. (Booting a server with phantom env vars or
+    # missing routes would just multiply error noise.)
+    has_blockers = any(
+        not r.passed and r.severity == "error" for r in results
+    )
+    if not has_blockers:
+        results.extend(_wiring_dynamic_checks(workspace, be))
+    else:
+        results.append(CheckResult(
+            "wiring", True,
+            "dynamic boot+probe skipped — fix topology/contract errors above first",
+            severity="info",
+        ))
+    return results
+
+
 def run_validation(
     workspace: str,
     entry_point: str = "main.py",

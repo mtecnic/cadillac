@@ -34,7 +34,7 @@ from .prompts import (
 )
 from .quality import build_review_prompt
 from .tools import TOOL_DEFS, ToolExecutor, ModuleScopedExecutor, extract_failure_text
-from .validate import run_validation, run_module_validation, format_failures, results_to_dict
+from .validate import run_validation, run_module_validation, format_failures, results_to_dict, check_wiring
 from . import inspector
 
 
@@ -1959,6 +1959,15 @@ def _build_module(
         purpose = f.get("purpose", "") if isinstance(f, dict) else ""
         arch_excerpt += f"  - {fpath}: {purpose}\n"
 
+    # Append contract excerpt — this module's owned + consumed endpoints. Both
+    # frontend and backend modules see the SAME shapes here, which is the
+    # whole point of a contract: shape mismatches become impossible by
+    # construction (LLM is reading from one source).
+    from .contracts import Contract
+    _contract_excerpt = Contract.load(workspace).render_for_module(module_name)
+    if _contract_excerpt:
+        arch_excerpt += "\n" + _contract_excerpt + "\n"
+
     # Project-wide context (tech stack, constraints, all module names)
     project_context = _extract_project_context(architecture_text, modular_plan)
 
@@ -2093,10 +2102,16 @@ def _build_module(
     executor.phase_name = f"MODULE/{module_name}/BUILD"
     executor.grant_rewrites(max(len(mod.files), 5))
 
+    # Re-inject the contract excerpt for the BUILD pass so the LLM sees it
+    # while writing the actual implementation (it may have been compressed
+    # out of message history during the SCAFFOLD turns).
+    build_interface_stubs = interface_stubs
+    if _contract_excerpt:
+        build_interface_stubs = (build_interface_stubs + "\n\n" if build_interface_stubs else "") + _contract_excerpt
     build_prompt = build_module_build_prompt(
         module_name=module_name,
         module_test=mod.test_file or "",
-        interface_stubs=interface_stubs,
+        interface_stubs=build_interface_stubs,
         code_map=code_map,
         validation_failures=pre_build_failures,
         lessons_text=lessons_text,
@@ -2314,6 +2329,119 @@ def _build_module_summaries(modular_plan: ModularPlan, manifest: FileManifest) -
             parts.append(f"__init__.py:\n{summary}")
         parts.append("")
     return "\n".join(parts)
+
+
+def _iterate_unscoped(
+    workspace: str,
+    manifest,
+    plan: dict,
+    modular_plan,
+    entry_point: str,
+    cfg: Config,
+    lang,
+    emit,
+    lessons_text: str = "",
+    wiring_failures: str = "",
+    instruction: str = "",
+    max_rounds: int = 15,
+):
+    """Cross-cutting iterate pass with FULL workspace write access.
+
+    Used after modular iterate's WIRING fails — the bug almost always spans
+    modules (e.g., backend/api/app.py's teardown calls a method whose
+    thread-safety is enforced in backend/db/repository.py). The module-scoped
+    executor can't reach across, so we run an unscoped pass with the WIRING
+    failures explicitly injected as the things-to-fix.
+    """
+    from .codemap import CodeMapBuilder
+    from .quality import build_iterate_prompt
+
+    error_tracker = ErrorTracker(manifest)
+    executor = ToolExecutor(workspace, manifest, context_budget=cfg.max_context_tokens)
+    executor.build_mode = True
+    executor.config_writes_allowed = False
+    executor.scratch = Scratch(workspace)
+    executor.phase_name = "ITERATE/unscoped"
+    executor.grant_rewrites(max(len(manifest.files), 10))
+    progress = Progress(task=instruction or "iterate-unscoped", workspace=workspace)
+
+    failures_text = wiring_failures or ""
+    prompt_overhead = len(instruction or "") // 4 + 2000
+    budget = max(cfg.max_context_tokens - prompt_overhead - 8000, 10000)
+    code_map_builder = CodeMapBuilder(workspace, budget_tokens=budget, lang=lang)
+    code_map = code_map_builder.build(failure_text=failures_text)
+
+    iterate_prompt = build_iterate_prompt(
+        entry_point=entry_point,
+        manifest_summary=manifest.to_detailed(),
+        validation_failures=failures_text,
+        instruction=instruction or (
+            "Fix the WIRING failures above. These are real cross-layer "
+            "runtime bugs — the per-layer tests passed but the actual app "
+            "is broken. Focus only on the failures listed."
+        ),
+        code_map=code_map,
+        lang=lang,
+    )
+    user_msg = (
+        "WIRING failures (cross-layer HTTP smoke caught these):\n\n"
+        f"{wiring_failures}\n\n"
+        "These bugs only manifest at HTTP runtime, not in the per-layer test suite. "
+        "Likely fixes: thread-safety on shared resources (sqlite3.connect needs "
+        "check_same_thread=False), CORS allowlist, env-var loading, contract-route "
+        "alignment. Edit any file in the workspace to fix — you have UNSCOPED write "
+        "access for this pass."
+    )
+    messages = _build_messages(iterate_prompt, user_msg)
+
+    ITERATE_TOOL_NAMES = {"edit_file", "write_file", "line_edit", "run_command", "read_file"}
+    ITERATE_TOOLS = [t for t in TOOL_DEFS if t["function"]["name"] in ITERATE_TOOL_NAMES]
+
+    state = PhaseState()
+    state.current = Phase.BUILD
+    state.max_rounds[Phase.BUILD] = max_rounds
+    no_tool_rounds = 0
+    no_edit_rounds = 0
+
+    while state.tick():
+        emit("phase",
+             label=f"ITERATE/unscoped (R{state.round_in_phase}/{max_rounds})",
+             total_rounds=state.total_rounds, n_files=len(manifest.files),
+             phase="iterate-unscoped",
+             round=state.round_in_phase, budget=max_rounds)
+
+        messages = trim_context(messages, max_tokens=cfg.max_context_tokens)
+        msg = chat(cfg, messages, tools=ITERATE_TOOLS, emit=emit)
+
+        if not msg.get("tool_calls"):
+            messages.append(msg)
+            no_tool_rounds += 1
+            if no_tool_rounds >= 3:
+                break
+            messages.append({"role": "user", "content":
+                "Use edit_file to apply the fix, then run_command to verify."
+            })
+            continue
+        no_tool_rounds = 0
+
+        _pre_versions = {p: info["version"] for p, info in manifest.files.items()}
+        executor.round_num = state.round_in_phase
+        process_tool_calls(
+            msg, messages, executor, error_tracker, None, progress, emit=emit,
+            allowed_tools=ITERATE_TOOL_NAMES,
+        )
+
+        has_edit = any(
+            info["version"] > _pre_versions.get(p, 0)
+            for p, info in manifest.files.items()
+        )
+        if has_edit:
+            no_edit_rounds = 0
+        else:
+            no_edit_rounds += 1
+            if no_edit_rounds >= 4:
+                emit("log", msg="[ITERATE/unscoped] no edits for 4 rounds, stopping")
+                break
 
 
 def _iterate_module(
@@ -2683,6 +2811,17 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
 
                             with open(os.path.join(workspace, "plan.json"), "w") as f:
                                 json.dump(plan, f, indent=2)
+
+                            # Persist the API contract (if any) as the single
+                            # source of truth for cross-module HTTP shapes.
+                            from .contracts import Contract
+                            _contract = Contract.from_plan(plan)
+                            if not _contract.is_empty():
+                                _contract.save(workspace)
+                                emit("log", msg=(
+                                    f"[Contract: {len(_contract.endpoints)} endpoint(s), "
+                                    f"{len(_contract.types)} type(s)]"
+                                ))
 
                             # Use flat plan for batch tracker and progress
                             batch_tracker = BatchTracker(
@@ -3467,10 +3606,96 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             continue
                         else:
                             emit("log", msg=f"[INTEGRATE] Entry point passes (x{_integrate_pass_count}). Tests already reviewed, advancing to VALIDATE.")
-                            state.advance()  # -> VALIDATE
+                            state.advance()  # -> WIRING
                             messages = []
                             no_tool_rounds = 0
                             continue
+
+            # ── WIRING phase ──
+            # Cross-layer HTTP smoke. For projects with both a Python HTTP
+            # backend and a JS frontend, boots the backend on a free port and
+            # exercises it from a synthetic non-loopback Origin. Catches the
+            # classes of bug each per-layer test passes blindly: hardcoded
+            # localhost in client code, CORS allowlist not echoing real
+            # origins, backend routes that 500 on minimal payloads.
+            #
+            # No-op for single-layer projects (the check itself decides).
+            elif state.current == Phase.WIRING:
+                executor.build_mode = False
+                emit("log", msg="[WIRING] cross-layer HTTP smoke...")
+                wiring_results = check_wiring(workspace, lang)
+                # Surface every result to the live log so humans watching the
+                # build can see what fired. Errors get both the full first line
+                # and indented detail; info results show the one-line summary.
+                for r in wiring_results:
+                    if not r.output:
+                        continue
+                    if r.severity == "info":
+                        emit("log", msg=f"  [wiring/ok] {r.output[:200]}")
+                    else:
+                        first, _, rest = r.output.partition("\n")
+                        emit("log", msg=f"  [wiring/{r.severity}] {first[:200]}")
+                        for line in rest.splitlines()[:6]:
+                            if line.strip():
+                                emit("log", msg=f"      {line[:200]}")
+
+                wiring_failures = format_failures(wiring_results)
+                if not wiring_failures:
+                    state.advance()  # -> VALIDATE
+                    messages = []
+                    no_tool_rounds = 0
+                    continue
+
+                # Failures: feed back to BUILD for the LLM to fix, with the
+                # same retry budget VALIDATE uses (they're the same kind of
+                # gate — "fix what's broken before we ship").
+                last_failures_summary = wiring_failures[:1500]
+                progress.log(f"Wiring failed: {wiring_failures[:100]}")
+                emit("log", msg=(
+                    f"[WIRING] FAIL, retry {state.validate_retries + 1}/"
+                    f"{state.max_validate_retries}"
+                ))
+                if state.retreat_to_build():
+                    executor.grant_rewrites(max(len(manifest.files), 5))
+                    code_map = _get_code_map(failure_text=wiring_failures)
+                    emit("log", msg=(
+                        f"[Code map refreshed: tier {_code_map_builder.tier}, "
+                        f"{_code_map_builder.last_tokens} tokens]"
+                    ))
+                    build_prompt = build_build_prompt(
+                        entry_point=entry_point,
+                        manifest_summary=manifest.to_detailed(),
+                        progress_context=progress.to_context(),
+                        validation_failures=wiring_failures,
+                        lessons_text=lessons_text,
+                        code_map=code_map,
+                        lang=lang,
+                    )
+                    messages = _build_messages(build_prompt, task)
+                    phase_summary = _create_phase_summary(
+                        "WIRING", manifest, wiring_results, progress.build_log
+                    )
+                    messages.append({"role": "user", "content":
+                        f"{phase_summary}\n\n{wiring_failures}\n\n"
+                        "WIRING failed: cross-layer HTTP smoke caught a bug between "
+                        "frontend and backend. Read each [wiring] failure above and fix "
+                        "with edit_file. Common fixes:\n"
+                        "  - replace hardcoded http://localhost:NNNN in api client with "
+                        "`window.location.hostname`-derived URL\n"
+                        "  - load CORS_ORIGINS from os.environ in the after_request handler "
+                        "(not just app.config)\n"
+                        "  - wrap route bodies that crash on missing fields in proper 4xx "
+                        "validation responses, not let them raise\n"
+                        "Do NOT run the entry point — run_command is disabled this turn."
+                    })
+                    no_tool_rounds = 0
+                    continue
+                else:
+                    emit("log", msg="[WIRING] retries exhausted, advancing to VALIDATE")
+                    state.current = Phase.VALIDATE
+                    state.round_in_phase = 0
+                    messages = []
+                    continue
 
             # ── VALIDATE phase ──
             elif state.current == Phase.VALIDATE:
@@ -3962,6 +4187,52 @@ def iterate(workspace: str, cfg: Config, instruction: str = "",
             {"name": r.name, "passed": r.passed, "output": r.output[:100] if r.output else "OK"}
             for r in results
         ])
+
+        # Run WIRING — cross-layer HTTP smoke. Catches runtime bugs that
+        # the per-layer pipeline misses by definition (thread-safety, CORS,
+        # contract drift, route 5xx). If WIRING fails, the module-scoped
+        # passes above can't always fix it — the bug may span modules or
+        # be in a module that wasn't flagged as "affected" by the heuristic.
+        # Fall back to an UNSCOPED iterate pass so the LLM has full
+        # workspace write access to fix cross-cutting bugs.
+        emit("log", msg="[ITERATE] Running WIRING (cross-layer HTTP smoke)...")
+        wiring_results = check_wiring(workspace, lang)
+        for r in wiring_results:
+            if r.severity == "info" and r.output:
+                emit("log", msg=f"  [wiring/ok] {r.output[:200]}")
+            elif not r.passed:
+                first, _, rest = r.output.partition("\n")
+                emit("log", msg=f"  [wiring/{r.severity}] {first[:200]}")
+                for line in rest.splitlines()[:6]:
+                    if line.strip():
+                        emit("log", msg=f"      {line[:200]}")
+
+        wiring_failures = format_failures(wiring_results)
+        if wiring_failures:
+            emit("log", msg=(
+                "[ITERATE] WIRING failed — running unscoped pass to fix "
+                "cross-cutting issues (modules cannot edit each other)."
+            ))
+            _iterate_unscoped(
+                workspace, manifest, plan, modular_plan, entry_point, cfg,
+                lang, emit, lessons_text,
+                wiring_failures=wiring_failures,
+                instruction=instruction,
+                max_rounds=max_rounds or 15,
+            )
+            # Re-validate after unscoped pass.
+            emit("log", msg="[ITERATE] Re-running validation after unscoped pass...")
+            results = run_validation(workspace, entry_point, lang=lang)
+            wiring_results = check_wiring(workspace, lang)
+            still_failing = [
+                r for r in (results + wiring_results)
+                if not r.passed and r.severity == "error"
+            ]
+            if still_failing:
+                emit("log", msg=(
+                    f"[ITERATE] {len(still_failing)} error(s) remain after "
+                    "unscoped pass; manual intervention may be required."
+                ))
 
         elapsed = 0  # Not tracked for modular iterate
         emit("complete", status="ITERATE DONE (modular)", total_rounds=0,

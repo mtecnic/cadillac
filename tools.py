@@ -1156,12 +1156,32 @@ class ModuleScopedExecutor(ToolExecutor):
         self.module_path = module_path.rstrip("/")
 
     def normalize_path(self, path: str) -> str:
-        """Normalize path for WRITE operations — auto-prefixes module path."""
+        """Normalize path for WRITE operations.
+
+        Three cases:
+          1. Path already starts with `module_path/` → use as-is.
+          2. Path is a bare relative name (`foo.py`) → prefix with module_path.
+          3. Path is a workspace-relative path to a file in a DIFFERENT
+             module (e.g., scoped to `backend/api/` but LLM wrote
+             `backend/db/repository.py`) → DON'T silently corrupt the path
+             into `backend/api/backend/db/repository.py`. Return as-is so
+             the downstream `_check_path` produces a clean
+             "outside-of-module-scope" error the LLM can act on.
+        """
         path = super().normalize_path(path)
-        # Auto-prefix module_path if not already present
-        if not path.startswith(self.module_path + "/") and not path.startswith(self.module_path + os.sep):
-            path = f"{self.module_path}/{path}"
-        return path
+        if path.startswith(self.module_path + "/") or path.startswith(self.module_path + os.sep):
+            return path  # case 1
+        # Case 3: looks like a workspace-relative path to a real file in a
+        # different module. Heuristic: contains a "/" and the bare prefix
+        # before the first "/" is a sibling top-level dir of `module_path`.
+        if "/" in path:
+            full_at_root = os.path.join(self.workspace, path)
+            if os.path.exists(full_at_root):
+                # Not in our module scope — caller's `_check_path` will
+                # reject with a clean message.
+                return path
+        # Case 2: bare name, prefix with module_path.
+        return f"{self.module_path}/{path}"
 
     def _normalize_read_path(self, path: str) -> str:
         """Normalize path for READ operations — allows full workspace access.
