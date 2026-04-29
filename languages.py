@@ -233,6 +233,56 @@ def react_language() -> Language:
     )
 
 
+def electron_language() -> Language:
+    """Create Language config for Electron + React + TypeScript desktop apps.
+
+    Same node toolchain as react_language() — npm, vite, tsc, eslint, vitest —
+    plus electron + electron-builder + vite-plugin-electron. The OS launches
+    the main process (`src/main/main.ts`) which owns the BrowserWindow; the
+    renderer is a regular React app loaded inside it.
+
+    `build_cmd` here is the renderer build only (`npx vite build`). The
+    full installer step (`electron-builder --win`) is intentionally NOT in
+    `build_cmd` because (a) it downloads ~100MB of toolchain on first run,
+    (b) the validation pipeline runs `build_cmd` and shouldn't pay that
+    cost on every check, and (c) `.split()` on a `&&`-chained command would
+    pass `&&` as an argv token. Users / CI run electron-builder directly.
+    """
+    return Language(
+        name="electron",
+        family="node",
+        extensions=[".tsx", ".ts", ".jsx", ".js", ".css", ".html"],
+        entry_point="src/main/main.ts",
+        init_file="index.ts",
+        test_prefix="",
+        test_suffix=".test",
+        package_file="package.json",
+        install_cmd="npm install",
+        run_cmd="npx electron .",
+        build_cmd="npx vite build",
+        test_cmd=["npx", "vitest", "run"],
+        lint_cmd=["npx", "eslint", "."],
+        syntax_check_cmd=["npx", "tsc", "--noEmit"],
+        stdlib_modules=_NODE_BUILTINS,
+        import_pattern=re.compile(
+            r'''^\s*(?:import\s+.*?\s+from\s+['"]([^'"]+)['"]'''
+            r'''|import\s+['"]([^'"]+)['"]'''
+            r'''|(?:const|let|var)\s+.*?=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\))'''
+        ),
+        fence_langs=["typescript", "tsx", "javascript"],
+        coding_standards=quality.ELECTRON_CODING_STANDARDS,
+        project_structure=quality.ELECTRON_PROJECT_STRUCTURE,
+        anti_patterns=quality.ELECTRON_ANTI_PATTERNS,
+        few_shot_scaffold=quality.ELECTRON_FEW_SHOT_SCAFFOLD,
+        few_shot_main=quality.ELECTRON_FEW_SHOT_MAIN,
+        few_shot_db_pattern=quality.ELECTRON_FEW_SHOT_DB_PATTERN,
+        functional_test_guidance=quality.ELECTRON_FUNCTIONAL_TEST_GUIDANCE,
+        few_shot_naming=quality.ELECTRON_FEW_SHOT_NAMING,
+        iterate_prompt=quality.ELECTRON_ITERATE_PROMPT,
+        iterate_feature_prompt=quality.ELECTRON_ITERATE_FEATURE_PROMPT,
+    )
+
+
 def vue_language() -> Language:
     """Create Language config for Vue 3 + TypeScript projects (Vite)."""
     return Language(
@@ -324,6 +374,8 @@ _FRAMEWORK_KEYWORDS = frozenset({
     "react", "next.js", "nextjs", "express", "typescript",
     "vue", "svelte", "angular", "electron",
     "nest", "nestjs", "fastify", "koa", "webpack", "vite",
+    "desktop app", "windows app", "windows native", "windows desktop",
+    "native desktop", "cross-platform desktop",
 })
 
 _JS_KEYWORDS = frozenset({
@@ -356,7 +408,16 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
             if not any(kw in task_lower for kw in _PYTHON_KEYWORDS):
                 return html_language()
 
-    # Framework-specific detection — check BEFORE generic JS/TS
+    # Framework-specific detection — check BEFORE generic JS/TS.
+    # Electron must come BEFORE react: a task like "electron + react desktop
+    # app" mentions both keywords but should route to electron (the renderer
+    # is React, the wrapper is electron — different toolchain, different
+    # entry point, different security model).
+    if any(kw in task_lower for kw in (
+        "electron", "windows app", "windows native", "windows desktop",
+        "desktop app", "cross-platform desktop", "native desktop",
+    )):
+        return electron_language()
     if any(kw in task_lower for kw in ("react", "nextjs", "next.js")):
         return react_language()
     if "vue" in task_lower:

@@ -140,6 +140,24 @@ def _write_node_boilerplate(workspace: str, deps: list[str], lang,
             "dev": "vite", "build": "vite build", "preview": "vite preview",
             "test": "vitest run",
         }
+    elif lang.name == "electron":
+        # Electron + React + Vite via vite-plugin-electron. Same renderer
+        # toolchain as react_language(), plus electron + electron-builder
+        # for packaging + vite-plugin-electron to bundle main/preload during
+        # vite build. Renderer tests via vitest exactly like react.
+        dev_deps.update({
+            "@vitejs/plugin-react": "^4", "vite": "^5",
+            "vite-plugin-electron": "*",
+            "electron": "*", "electron-builder": "*",
+            "vitest": "^1", "@testing-library/react": "*",
+            "@testing-library/jest-dom": "*", "jsdom": "*",
+            "@types/react": "*", "@types/react-dom": "*",
+        })
+        scripts = {
+            "dev": "vite", "build": "vite build",
+            "package": "electron-builder --win --publish=never",
+            "test": "vitest run",
+        }
     elif lang.name == "vue":
         dev_deps.update({
             "@vitejs/plugin-vue": "^4", "vite": "^5",
@@ -470,6 +488,16 @@ def _protect_package_json(workspace: str, lang) -> bool:
 
     if pkg.get("type") != "module":
         return False
+
+    # Electron is a special case: even with vite + vitest in deps, the main
+    # process is loaded by electron's CJS-first runtime. `"type": "module"`
+    # in package.json forces every .js/.cjs require() in main to fail. Always
+    # strip for electron, regardless of ESM-ish dependencies.
+    if lang and lang.name == "electron":
+        del pkg["type"]
+        with open(pkg_path, "w") as f:
+            json.dump(pkg, f, indent=2)
+        return True
 
     # Preserve "type": "module" when the project uses an ESM-first ecosystem.
     # Vite, vitest, and the major SPA frameworks (React/Vue/Angular via Vite)

@@ -1739,3 +1739,291 @@ CURRENT ISSUES:
 {instruction}
 
 {code_map}"""
+
+
+# ── Electron (main + renderer) ───────────────────────────────────────────────
+#
+# Electron wraps a React renderer in a native window owned by a Node.js main
+# process. Two processes, two security contexts. The hard-won lessons here
+# are about keeping that boundary clean: contextIsolation on, nodeIntegration
+# off, IPC only through a preload script's contextBridge — the same pattern
+# every shipped electron app uses, and the one the LLM keeps trying to
+# bypass with `webPreferences: { nodeIntegration: true }` because it's
+# easier in the short term and ships a remote-code-execution hole.
+
+ELECTRON_CODING_STANDARDS = """\
+## Coding Standards (apply to ALL generated code)
+- Two processes: MAIN (Node.js + electron APIs) and RENDERER (Chromium + React).
+  They share NOTHING by default. The only bridge is a preload script.
+- TypeScript strict mode: tsconfig.json with "strict": true
+- Functional React components only in the renderer
+- Main process code lives in src/main/ — never imported by renderer code
+- Renderer code lives in src/renderer/ — never imports `electron` directly
+- IPC: main process exposes handlers via ipcMain.handle(channel, fn);
+  preload (src/main/preload.ts) wraps them in contextBridge.exposeInMainWorld('api', {...});
+  renderer calls them as `window.api.foo()`. Type the surface in src/renderer/global.d.ts.
+- BrowserWindow webPreferences MUST set: contextIsolation: true, nodeIntegration: false,
+  sandbox: true, preload: <path to compiled preload.js>
+- Use app.getPath('userData') for any persisted state — NEVER hardcode paths
+- electron-builder config goes in package.json under "build": { ... }
+- Use vite-plugin-electron in vite.config.ts so dev and prod use the same build pipeline"""
+
+ELECTRON_PROJECT_STRUCTURE = """\
+## Project Structure Guidelines (Electron + React + TypeScript via vite-plugin-electron)
+
+**Standard layout**:
+```
+package.json              # "main": "dist-electron/main.js", electron-builder "build" config
+tsconfig.json             # strict, jsx: react-jsx, module: ESNext
+vite.config.ts            # imports electron from 'vite-plugin-electron', main+preload entries
+index.html                # renderer entry HTML, references /src/renderer/main.tsx
+src/
+    main/
+        main.ts           # app.whenReady, BrowserWindow, IPC handlers
+        preload.ts        # contextBridge.exposeInMainWorld
+    renderer/
+        main.tsx          # ReactDOM.createRoot
+        App.tsx
+        global.d.ts       # `interface Window { api: { ... } }` for the IPC surface
+        components/
+        styles.css
+__tests__/                # vitest tests for renderer components only
+```
+
+**Critical setup files**:
+- `package.json`: `"main": "dist-electron/main.js"`, devDeps include
+  `electron`, `electron-builder`, `vite-plugin-electron`, `vite`,
+  `@vitejs/plugin-react`, `react`, `react-dom`, `typescript`, `vitest`,
+  `@testing-library/react`, `@testing-library/jest-dom`, `jsdom`.
+  Scripts: `"dev": "vite"`, `"build": "vite build"`,
+  `"package": "electron-builder --win --publish=never"`,
+  `"test": "vitest run"`. Add `"build": { "appId": "...", "productName": "...",
+  "win": { "target": "nsis" }, "files": ["dist/**/*", "dist-electron/**/*"] }`.
+- `vite.config.ts`: `import electron from 'vite-plugin-electron';
+  export default defineConfig({ plugins: [react(), electron([
+    { entry: 'src/main/main.ts' },
+    { entry: 'src/main/preload.ts', onstart(args) { args.reload(); } },
+  ])] });`
+- `tsconfig.json`: standard React strict config. Module resolution "bundler".
+
+**Larger projects** (15+ files): handled by modular pipeline."""
+
+ELECTRON_ANTI_PATTERNS = """\
+## NEVER Do These (electron + react + IPC mistakes)
+- NEVER set `nodeIntegration: true` in webPreferences — this exposes Node.js
+  to remote content. Always use a preload + contextBridge instead.
+- NEVER set `contextIsolation: false` — same reason. Both default-on now.
+- NEVER `import { app, ipcRenderer } from 'electron'` in renderer code —
+  the renderer must NOT import the electron module. Use `window.api.*`.
+- NEVER hardcode filesystem paths. Use `app.getPath('userData' | 'documents' | 'temp')`.
+- NEVER forget the macOS quit gate: `app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit(); });`
+- NEVER ship a build without `"main"` set in package.json — electron won't know what to launch.
+- NEVER use `require('electron')` inside the renderer — same as the import rule.
+- NEVER mutate React state directly; standard React rules still apply in the renderer
+- NEVER skip the preload `contextBridge.exposeInMainWorld` step — direct
+  ipcRenderer access from the renderer is blocked when contextIsolation is on (good)."""
+
+ELECTRON_FEW_SHOT_SCAFFOLD = """\
+## Example: writing the main process + preload + renderer-side typing
+
+```
+write_file("src/main/main.ts", `import { app, BrowserWindow, ipcMain } from 'electron';
+import { join } from 'path';
+
+const isDev = !app.isPackaged;
+
+function createWindow() {
+    const win = new BrowserWindow({
+        width: 1024,
+        height: 768,
+        webPreferences: {
+            preload: join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true,
+        },
+    });
+    if (isDev) {
+        win.loadURL('http://localhost:5173');
+    } else {
+        win.loadFile(join(__dirname, '../dist/index.html'));
+    }
+}
+
+ipcMain.handle('app:getVersion', () => app.getVersion());
+
+app.whenReady().then(() => {
+    createWindow();
+    app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+});
+
+app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+});
+`)
+
+write_file("src/main/preload.ts", `import { contextBridge, ipcRenderer } from 'electron';
+
+contextBridge.exposeInMainWorld('api', {
+    getVersion: (): Promise<string> => ipcRenderer.invoke('app:getVersion'),
+});
+`)
+
+write_file("src/renderer/global.d.ts", `export interface ElectronAPI {
+    getVersion: () => Promise<string>;
+}
+
+declare global {
+    interface Window {
+        api: ElectronAPI;
+    }
+}
+`)
+```
+
+The renderer then calls `await window.api.getVersion()` like any async function — no
+`require`, no `electron` import."""
+
+ELECTRON_FEW_SHOT_MAIN = """\
+## Example: src/renderer/main.tsx (renderer entry — same as a vite-plugin-react app)
+```typescript
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { App } from './App';
+import './styles.css';
+
+const root = document.getElementById('root');
+if (!root) throw new Error('Root element #root not found in index.html');
+
+createRoot(root).render(
+    <StrictMode>
+        <App />
+    </StrictMode>,
+);
+```
+
+## Example: src/renderer/App.tsx (uses the IPC surface typed in global.d.ts)
+```typescript
+import { useEffect, useState } from 'react';
+
+export function App() {
+    const [version, setVersion] = useState<string>('');
+    useEffect(() => {
+        window.api.getVersion().then(setVersion);
+    }, []);
+    return <div className="app"><h1>v{version}</h1></div>;
+}
+```"""
+
+ELECTRON_FEW_SHOT_DB_PATTERN = """\
+## Persistence in Electron — main process owns it, renderer asks via IPC
+
+Two common choices:
+
+### Settings / small JSON state — `electron-store`
+```typescript
+// src/main/main.ts
+import Store from 'electron-store';
+const store = new Store<{ theme: 'light' | 'dark' }>({ defaults: { theme: 'light' } });
+
+ipcMain.handle('settings:get', (_e, key: string) => store.get(key));
+ipcMain.handle('settings:set', (_e, key: string, value: unknown) => store.set(key, value));
+```
+
+### Real SQL — `better-sqlite3` (synchronous, fast, in main process only)
+```typescript
+// src/main/db.ts
+import Database from 'better-sqlite3';
+import { app } from 'electron';
+import { join } from 'path';
+
+const db = new Database(join(app.getPath('userData'), 'data.db'));
+db.exec(`CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)`);
+
+export function listNotes() {
+    return db.prepare('SELECT id, body FROM notes ORDER BY id DESC').all();
+}
+```
+
+Renderer NEVER touches the DB directly — exposes `notes:list`, `notes:create`
+via IPC and the renderer calls `window.api.listNotes()`.
+
+NEVER bundle better-sqlite3 in the renderer build — it's a native module
+that lives in the main process only."""
+
+ELECTRON_FUNCTIONAL_TEST_GUIDANCE = """\
+## Renderer testing (vitest + @testing-library/react)
+Same rules as a regular React+Vite project. Mock `window.api` per test:
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import { App } from './App';
+
+beforeEach(() => {
+    (window as unknown as { api: { getVersion: () => Promise<string> } }).api = {
+        getVersion: vi.fn().mockResolvedValue('1.2.3'),
+    };
+});
+
+describe('App', () => {
+    it('renders the version from the IPC bridge', async () => {
+        render(<App />);
+        await waitFor(() => expect(screen.getByText('v1.2.3')).toBeInTheDocument());
+    });
+});
+```
+
+Use `within(container).getByText(...)` to disambiguate when multiple matches.
+Prefer `getByRole` > `getByLabelText` > `getByText` for stable queries.
+Cast input refs as `HTMLInputElement` when reading `.value`.
+
+Main-process tests are out of scope here — they require an electron runtime
+(electron-mocha) which the autobuilder doesn't currently set up."""
+
+ELECTRON_FEW_SHOT_NAMING = """\
+## Naming conventions
+- Components: PascalCase, one component per file matching the filename: TaskList.tsx, Header.tsx
+- Hooks: camelCase prefixed `use`: useNotes.ts, useSettings.ts
+- IPC channel names: namespaced kebab-case: 'notes:list', 'settings:get', 'app:getVersion'
+- Files in src/main/: lowercase, role-named: main.ts, preload.ts, db.ts, ipc.ts
+- Tests: ComponentName.test.tsx in __tests__/ or alongside the component
+- The IPC surface type lives in src/renderer/global.d.ts and is named `ElectronAPI`."""
+
+ELECTRON_ITERATE_PROMPT = """\
+You are iterating on an Electron + React + TypeScript project.
+
+Tools available: edit_file, write_file, line_edit, run_command, read_file.
+
+Rules:
+- Make the smallest change that fixes the failure
+- After editing, run `npx tsc --noEmit` and `npx vitest run` to verify
+- Renderer changes must NOT introduce direct electron imports — go through
+  the preload IPC bridge and `window.api.*`
+- Main process changes go in src/main/, renderer changes in src/renderer/
+- If the IPC surface changes, update both src/main/preload.ts and
+  src/renderer/global.d.ts in the same pass
+
+CURRENT ISSUES:
+{validation_failures}
+
+{code_map}"""
+
+ELECTRON_ITERATE_FEATURE_PROMPT = """\
+Implement the requested feature. Rules:
+- Renderer-only feature: edit src/renderer/, add tests with vitest
+- Feature touching the OS / filesystem / native: add an ipcMain.handle in
+  src/main/main.ts, expose via contextBridge in src/main/preload.ts,
+  type in src/renderer/global.d.ts, call from React in src/renderer/
+- After: `npx tsc --noEmit && npx vitest run` must pass
+- Keep contextIsolation: true and nodeIntegration: false. Always.
+
+CURRENT ISSUES:
+{validation_failures}
+
+{instruction}
+
+{code_map}"""

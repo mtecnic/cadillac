@@ -16,10 +16,11 @@ PHASE_HISTORY_PATH = os.path.join(MEMORY_DIR, "phase_budgets.jsonl")
 # Common keywords used to auto-tag lessons by language/framework/phase
 _KNOWN_TAGS = {
     "python", "typescript", "javascript", "react", "vue", "angular",
+    "electron", "desktop",
     "html", "css", "node", "flask", "django", "fastapi", "express",
     "pygame", "click", "asyncio", "aiosqlite", "sqlite", "pytest",
     "vitest", "jest", "modular", "flat",
-    "plan", "deps", "scaffold", "review", "build", "integrate", "validate", "package",
+    "plan", "deps", "scaffold", "review", "build", "integrate", "wiring", "validate", "package",
 }
 
 

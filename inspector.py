@@ -390,7 +390,7 @@ def _static_collection_check(workspace: str, lang) -> Violation | None:
             fix="Fix the cross-module import/type error listed in detail.",
             detail=combined,
         )
-    if lang.family == "node" and (not lang.name or lang.name not in ("react", "vue", "angular")):
+    if lang.family == "node" and (not lang.name or lang.name not in ("react", "vue", "angular", "electron")):
         try:
             r = subprocess.run(
                 ["npx", "tsc", "--noEmit"],
