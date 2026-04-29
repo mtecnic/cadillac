@@ -553,7 +553,7 @@ def check_entry_point(workspace: str, entry_point: str = "main.py", lang=None) -
         return [CheckResult("run", True, f"Entry point {entry_point} exists")]
 
     # Framework projects (React/Vue/Angular): entry point is a DOM mount, not executable
-    if lang and lang.name in ("react", "vue", "angular"):
+    if lang and lang.name in ("react", "vue", "angular", "electron"):
         if lang.build_cmd:
             node_dir = _find_node_project_dir(workspace)
             cmd = _npx_no_install(lang.build_cmd.split())
@@ -1190,8 +1190,8 @@ def check_functional_smoke(workspace: str, entry_point: str = "main.py", lang=No
 
 def _check_functional_smoke_ts(workspace: str, entry_point: str, lang) -> list[CheckResult]:
     """Generate and run a JS smoke test that imports all src modules."""
-    # For framework projects (React/Vue/Angular), use build as functional check
-    if lang and lang.build_cmd and lang.name in ("react", "vue", "angular"):
+    # For framework projects (React/Vue/Angular/Electron), use build as functional check
+    if lang and lang.build_cmd and lang.name in ("react", "vue", "angular", "electron"):
         node_dir = _find_node_project_dir(workspace)
         cmd = _npx_no_install(lang.build_cmd.split())
         r = _run(cmd, cwd=node_dir, timeout=120)
