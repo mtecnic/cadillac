@@ -1,0 +1,224 @@
+"""Tests for the security check (Phase 1.2 of weakness roadmap).
+
+Each pattern in `_SEC_PATTERNS` is exercised with a positive case (must
+fire) and a negative case (must NOT fire). False positives erode trust
+faster than false negatives — every test pins both sides.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+
+from cadillac.languages import python_language, react_language
+from cadillac.validate import check_security
+
+
+def _write(td: str, rel: str, content: str) -> None:
+    path = os.path.join(td, rel)
+    os.makedirs(os.path.dirname(path) or td, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def _findings(td: str, lang=None) -> tuple[list, list]:
+    """Run check_security; return (errors, warnings) result lists."""
+    results = check_security(td, lang or python_language())
+    errors = [r for r in results if not r.passed and r.severity == "error"]
+    warnings = [r for r in results if not r.passed and r.severity == "warning"]
+    return errors, warnings
+
+
+class TestEmptyWorkspace(unittest.TestCase):
+    def test_no_findings_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = check_security(td, python_language())
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].passed)
+            self.assertIn("no obvious security issues", results[0].output)
+
+
+class TestHardcodedSecrets(unittest.TestCase):
+    def test_password_literal_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "auth.py", 'password = "supersecret123"\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("hardcoded_secret" in e.output for e in errors),
+                            f"expected hardcoded_secret HIGH, got: {[e.output for e in errors]}")
+
+    def test_jwt_secret_literal_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "auth.py", 'JWT_SECRET = "dev-secret-please-change"\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("hardcoded_secret" in e.output for e in errors))
+
+    def test_password_from_env_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "auth.py",
+                   'import os\npassword = os.environ.get("PASSWORD")\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+    def test_short_placeholder_not_flagged(self):
+        # `password = ""` is an empty default, not a leak.
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "config.py", 'password = ""\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+    def test_aws_access_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "deploy.py", 'AWS_KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("aws_access_key" in e.output for e in errors))
+
+
+class TestSqlInjection(unittest.TestCase):
+    def test_fstring_in_execute_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "db.py",
+                   'def get(id):\n'
+                   '    return cursor.execute(f"SELECT * FROM users WHERE id={id}")\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("sql_fstring" in e.output for e in errors))
+
+    def test_concat_in_execute_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "db.py",
+                   'def get(name):\n'
+                   '    return cursor.execute("SELECT * FROM x WHERE name=" + name)\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("sql_concat" in e.output for e in errors))
+
+    def test_parameterized_query_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "db.py",
+                   'def get(id):\n'
+                   '    return cursor.execute("SELECT * FROM users WHERE id=?", (id,))\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+
+class TestCommandInjection(unittest.TestCase):
+    def test_shell_true_with_fstring(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "ops.py",
+                   'import subprocess\n'
+                   'def run(cmd):\n'
+                   '    return subprocess.run(f"sh -c \'{cmd}\'", shell=True)\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("shell_true_with_interp" in e.output for e in errors))
+
+    def test_shell_true_literal_arg_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "ops.py",
+                   'import subprocess\n'
+                   'subprocess.run("ls -la", shell=True)\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+    def test_argv_list_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "ops.py",
+                   'import subprocess\n'
+                   'subprocess.run(["ls", "-la"])\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+
+class TestEvalExec(unittest.TestCase):
+    def test_eval_on_input_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "calc.py",
+                   'def evaluate(expr):\n'
+                   '    return eval(input("expr: "))\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("eval_user_input" in e.output for e in errors))
+
+    def test_eval_on_literal_not_flagged(self):
+        # eval() of a literal is dumb but not RCE — don't false-positive.
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "calc.py", 'x = eval("1 + 1")\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+
+class TestJwt(unittest.TestCase):
+    def test_alg_none_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "auth.py",
+                   'import jwt\n'
+                   'token = jwt.encode(payload, key, algorithm="none")\n')
+            errors, _ = _findings(td)
+            self.assertTrue(any("jwt_alg_none" in e.output for e in errors))
+
+
+class TestWeakCrypto(unittest.TestCase):
+    def test_md5_for_password_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "auth.py",
+                   'import hashlib\n'
+                   'def hash_password(password):\n'
+                   '    return hashlib.md5(password.encode()).hexdigest()\n')
+            _, warnings = _findings(td)
+            self.assertTrue(any("weak_password_hash" in w.output for w in warnings))
+
+    def test_md5_on_id_not_flagged(self):
+        # md5() of a non-credential value is fine (e.g., cache keys, ETags).
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "cache.py",
+                   'import hashlib\n'
+                   'def cache_key(url):\n'
+                   '    return hashlib.md5(url.encode()).hexdigest()\n')
+            _, warnings = _findings(td)
+            self.assertFalse(any("weak_password_hash" in w.output for w in warnings))
+
+
+class TestTlsVerify(unittest.TestCase):
+    def test_verify_false_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "client.py",
+                   'import requests\nr = requests.get("https://x.test", verify=False)\n')
+            _, warnings = _findings(td)
+            self.assertTrue(any("tls_verify_disabled" in w.output for w in warnings))
+
+
+class TestReactDangerouslySet(unittest.TestCase):
+    def test_dangerously_set_inner_html_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "Article.tsx",
+                   'export function Article({ html }: { html: string }) {\n'
+                   '  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n'
+                   '}\n')
+            _, warnings = _findings(td, react_language())
+            self.assertTrue(
+                any("dangerously_set_inner_html" in w.output for w in warnings),
+                f"expected dangerouslySetInnerHTML warning, got warnings={[w.output for w in warnings]}",
+            )
+
+
+class TestSkipping(unittest.TestCase):
+    def test_node_modules_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            # A real-looking secret in a vendored dep — must NOT fire.
+            _write(td, "node_modules/some-pkg/index.js",
+                   'const password = "leaked-from-vendor-12345";\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+    def test_test_files_ignored(self):
+        # password literal in a test fixture — fixtures are fine.
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "tests/test_auth.py", 'password = "fixture-password-123"\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+    def test_pycache_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "__pycache__/x.py", 'JWT_SECRET = "leaked"\n')
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

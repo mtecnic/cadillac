@@ -2357,19 +2357,421 @@ def check_wiring(workspace: str, lang=None) -> list[CheckResult]:
     return results
 
 
+# --------------------------------------------------------------------------- #
+#  SECURITY — static OWASP-flavor scan (Phase 1.2 of weakness roadmap)        #
+# --------------------------------------------------------------------------- #
+#
+# The LLM cheerfully ships footguns the rest of the pipeline can't see:
+# JWT_SECRET = "dev"; cursor.execute(f"SELECT * FROM x WHERE id={id}");
+# subprocess.run(f"sh -c '{cmd}'", shell=True); hashlib.md5(password).
+# Tests pass — they don't probe security. Lint passes — it's not a lint rule.
+# This check fires regex patterns chosen for high signal + low false positives.
+# Always runs (no external deps); augments with `bandit` if it's on PATH.
+
+_SEC_SKIP_DIRS = (
+    "node_modules", "__pycache__", "dist", "build", "venv", ".venv",
+    ".git", ".cadillac", ".pytest_cache",
+)
+
+
+@dataclass
+class _SecFinding:
+    rule: str
+    severity: str       # "high" | "medium"
+    file: str           # relative path
+    line: int
+    snippet: str        # the matched line, trimmed
+    why: str            # one-line explanation
+
+
+def _sec_relevant_file(path: str, lang) -> str | None:
+    """Return 'py' | 'ts' | 'js' | None depending on whether we should scan
+    this file. Skips dependency dirs and dotfiles."""
+    parts = path.split(os.sep)
+    if any(p in _SEC_SKIP_DIRS for p in parts):
+        return None
+    if path.endswith(".py"):
+        return "py"
+    if path.endswith((".ts", ".tsx")):
+        return "ts"
+    if path.endswith((".js", ".jsx")):
+        return "js"
+    return None
+
+
+# Each pattern: dict with rule, severity, kinds (which file types apply),
+# regex (pre-compiled), why (human-readable explanation).
+# Patterns are written to be PRECISE — false positives erode trust faster than
+# false negatives, and bandit/semgrep cover the rest if installed.
+_SEC_PATTERNS: list[dict] = [
+    # ── Hardcoded secrets ────────────────────────────────────────────────
+    {
+        "rule": "hardcoded_secret",
+        "severity": "high",
+        "kinds": {"py", "ts", "js"},
+        # Assignment to a secret-named identifier with a string literal that
+        # is NOT obviously a placeholder/empty/env lookup. ≥6 chars is a
+        # heuristic to skip "" and "x" placeholders.
+        "regex": re.compile(
+            r"""(?i)\b(password|passwd|api[_-]?key|secret[_-]?key|"""
+            r"""auth[_-]?token|access[_-]?token|jwt[_-]?secret|"""
+            r"""private[_-]?key|client[_-]?secret)\s*[:=]\s*"""
+            r"""['"]([^'"\s]{6,})['"]"""
+        ),
+        "why": ("hardcoded secret in source — anyone with repo access has the "
+                "credential. Read from os.environ / a vault / a runtime config."),
+    },
+    {
+        "rule": "aws_access_key",
+        "severity": "high",
+        "kinds": {"py", "ts", "js"},
+        "regex": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+        "why": "AWS access key literal in source.",
+    },
+    {
+        "rule": "private_key_block",
+        "severity": "high",
+        "kinds": {"py", "ts", "js"},
+        "regex": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        "why": "PEM private key embedded in source.",
+    },
+    # ── SQL injection ────────────────────────────────────────────────────
+    {
+        "rule": "sql_fstring",
+        "severity": "high",
+        "kinds": {"py"},
+        # cursor.execute(f"...{var}..."), conn.execute(f"..."), etc.
+        "regex": re.compile(
+            r"""\.execute\s*\(\s*f["'][^"']*\{[^"']*\}"""
+        ),
+        "why": ("f-string SQL — user input substituted directly into the query. "
+                "Use parameterized queries: execute(\"... ?\", (val,)) or :name binding."),
+    },
+    {
+        "rule": "sql_concat",
+        "severity": "high",
+        "kinds": {"py"},
+        "regex": re.compile(
+            r"""\.execute\s*\(\s*["'][^"']*["']\s*\+\s*\w"""
+        ),
+        "why": ("string concatenation in SQL — same risk as f-string. "
+                "Use parameterized queries."),
+    },
+    # ── Command injection ────────────────────────────────────────────────
+    {
+        "rule": "shell_true_with_interp",
+        "severity": "high",
+        "kinds": {"py"},
+        # subprocess.run/call/Popen with shell=True AND f-string OR + concat
+        # in the command. Literal-only shell=True is fine (annoying but not
+        # injection); interpolation is the bug.
+        "regex": re.compile(
+            r"""subprocess\.\w+\s*\(\s*f["']"""
+            r"""[^)]*shell\s*=\s*True"""
+            r"""|subprocess\.\w+\s*\([^)]*\+\s*\w[^)]*shell\s*=\s*True"""
+        ),
+        "why": ("shell=True with interpolated user input is a remote-shell hole. "
+                "Pass argv as a list with shell=False, or shlex.quote each arg."),
+    },
+    {
+        "rule": "os_system_interp",
+        "severity": "high",
+        "kinds": {"py"},
+        "regex": re.compile(r"""os\.system\s*\(\s*f["']|os\.system\s*\([^)]*\+\s*\w"""),
+        "why": "os.system with interpolation — shell injection. Use subprocess with argv list.",
+    },
+    # ── Dangerous eval ───────────────────────────────────────────────────
+    {
+        "rule": "eval_user_input",
+        "severity": "high",
+        "kinds": {"py"},
+        # eval(f"..."), eval(request.args[...]), eval(input(...))
+        "regex": re.compile(
+            r"""\beval\s*\(\s*(f["']|request\.|input\(|sys\.argv|os\.environ\b)"""
+        ),
+        "why": "eval() on non-literal input — arbitrary code execution.",
+    },
+    {
+        "rule": "exec_user_input",
+        "severity": "high",
+        "kinds": {"py"},
+        "regex": re.compile(
+            r"""\bexec\s*\(\s*(f["']|request\.|input\(|sys\.argv|os\.environ\b)"""
+        ),
+        "why": "exec() on non-literal input — arbitrary code execution.",
+    },
+    {
+        "rule": "js_eval",
+        "severity": "high",
+        "kinds": {"ts", "js"},
+        "regex": re.compile(r"""\beval\s*\(|new\s+Function\s*\("""),
+        "why": "eval() / new Function() — arbitrary JS execution if input is attacker-controlled.",
+    },
+    # ── JWT footguns ─────────────────────────────────────────────────────
+    {
+        "rule": "jwt_alg_none",
+        "severity": "high",
+        "kinds": {"py", "ts", "js"},
+        "regex": re.compile(r"""algorithm[s]?\s*[:=]\s*['"]?(none|None)['"]?"""),
+        "why": ("JWT algorithm 'none' disables signature verification — anyone can "
+                "forge tokens. Use HS256 / RS256 with a real key."),
+    },
+    {
+        "rule": "jwt_verify_false",
+        "severity": "high",
+        "kinds": {"py", "ts", "js"},
+        "regex": re.compile(
+            r"""jwt\.\w+\s*\([^)]*verify\s*[:=]\s*False"""
+            r"""|verify_signature\s*[:=]\s*False"""
+        ),
+        "why": "JWT decode with verify=False — accepts any token. Use a real key + verify=True.",
+    },
+    # ── Insecure transport ───────────────────────────────────────────────
+    {
+        "rule": "tls_verify_disabled",
+        "severity": "medium",
+        "kinds": {"py"},
+        "regex": re.compile(r"""\bverify\s*=\s*False\b|_create_unverified_context"""),
+        "why": ("TLS verification disabled — vulnerable to man-in-the-middle. "
+                "Acceptable in tests; never in production paths."),
+    },
+    # ── Weak crypto for password/token ───────────────────────────────────
+    {
+        "rule": "weak_password_hash",
+        "severity": "medium",
+        "kinds": {"py"},
+        # md5/sha1 used on a line that mentions password/passwd/token (heuristic)
+        "regex": re.compile(
+            r"""hashlib\.(md5|sha1)\s*\([^)]*(password|passwd|pwd|token|secret)"""
+        ),
+        "why": ("md5/sha1 for password/token hashing — both are fast (good for "
+                "attackers) and weak. Use bcrypt / argon2 / scrypt."),
+    },
+    {
+        "rule": "weak_token_random",
+        "severity": "medium",
+        "kinds": {"py"},
+        # random.X used on a line mentioning token/secret/password
+        "regex": re.compile(
+            r"""\brandom\.(random|choice|randint|getrandbits)\s*\([^)]*\)"""
+            r"""[^\n]*\b(token|secret|password|nonce|salt|key)\b"""
+            r"""|\b(token|secret|password|nonce|salt|key)\b[^\n]*"""
+            r"""=\s*['"]?random\.(random|choice|randint|getrandbits)"""
+        ),
+        "why": ("random.* for token/secret generation — predictable. "
+                "Use the `secrets` module: secrets.token_urlsafe(), secrets.token_bytes()."),
+    },
+    # ── Timing attacks on credential compare ─────────────────────────────
+    {
+        "rule": "constant_time_compare",
+        "severity": "medium",
+        "kinds": {"py"},
+        # password == provided OR token == expected — should be hmac.compare_digest
+        "regex": re.compile(
+            r"""\b(password|passwd|token|secret|hmac|signature|digest|hash)\b"""
+            r"""\s*==\s*\b(\w+)\b"""
+            r"""|\b(\w+)\s*==\s*\b(password|passwd|token|secret|hmac|signature|digest|hash)\b"""
+        ),
+        "why": ("== comparison of password/token leaks length & prefix via timing. "
+                "Use hmac.compare_digest(a, b) for constant-time comparison."),
+    },
+    # ── XSS in DOM / React ───────────────────────────────────────────────
+    {
+        "rule": "innerhtml_assignment",
+        "severity": "medium",
+        "kinds": {"ts", "js"},
+        # element.innerHTML = <something not an obvious literal>. Skip lines
+        # where the RHS is a quoted string with no template-literal interpolation.
+        "regex": re.compile(
+            r"""\.innerHTML\s*=\s*(?!['"][^'"]*['"]\s*[;]?\s*$)(?!`[^`${]*`\s*[;]?\s*$)"""
+        ),
+        "why": ("innerHTML assignment with non-literal RHS — XSS if user input "
+                "ever reaches it. Use textContent, or sanitize via DOMPurify."),
+    },
+    {
+        "rule": "dangerously_set_inner_html",
+        "severity": "medium",
+        "kinds": {"ts", "js"},
+        "regex": re.compile(r"""dangerouslySetInnerHTML\s*[:=]\s*\{"""),
+        "why": ("dangerouslySetInnerHTML — XSS unless the value is sanitized "
+                "(DOMPurify) or comes from a trusted source like a markdown lib."),
+    },
+    # ── Production debug / wide-open hosts ───────────────────────────────
+    {
+        "rule": "wide_open_hosts",
+        "severity": "medium",
+        "kinds": {"py"},
+        "regex": re.compile(r"""ALLOWED_HOSTS\s*=\s*\[\s*['"]\*['"]\s*\]"""),
+        "why": "ALLOWED_HOSTS=['*'] disables Django's Host-header check.",
+    },
+]
+
+
+def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
+    """Walk source tree, fire each pattern, return findings."""
+    findings: list[_SecFinding] = []
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _SEC_SKIP_DIRS]
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, workspace)
+            kind = _sec_relevant_file(rel, lang)
+            if kind is None:
+                continue
+            try:
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except Exception:
+                continue
+            # Skip files that are tests — security patterns there are usually
+            # fixtures (e.g., `password = "test1234"` in a unit test) and
+            # flagging them is mostly noise.
+            base = os.path.basename(rel)
+            if base.startswith("test_") or base.endswith((
+                ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+                ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+                "_test.py",
+            )) or "/__tests__/" in rel or "/tests/" in rel or rel.startswith("tests/"):
+                continue
+            for pat in _SEC_PATTERNS:
+                if kind not in pat["kinds"]:
+                    continue
+                for m in pat["regex"].finditer(text):
+                    line_no = text[:m.start()].count("\n") + 1
+                    snippet = text.splitlines()[line_no - 1].strip()
+                    if len(snippet) > 200:
+                        snippet = snippet[:200] + "…"
+                    # De-dup: don't fire the same rule on the same line twice.
+                    if any(
+                        f.rule == pat["rule"] and f.file == rel and f.line == line_no
+                        for f in findings
+                    ):
+                        continue
+                    findings.append(_SecFinding(
+                        rule=pat["rule"],
+                        severity=pat["severity"],
+                        file=rel,
+                        line=line_no,
+                        snippet=snippet,
+                        why=pat["why"],
+                    ))
+    return findings
+
+
+def _try_bandit(workspace: str, lang) -> list[_SecFinding]:
+    """Run bandit if it's on PATH. Returns [] cleanly if not available."""
+    if not lang or lang.family != "python":
+        return []
+    import shutil
+    if not shutil.which("bandit"):
+        return []
+    try:
+        r = subprocess.run(
+            ["bandit", "-r", workspace, "-f", "json", "--skip", "B101", "-q"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return []
+    if not r.stdout:
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return []
+    findings: list[_SecFinding] = []
+    for item in data.get("results", []) or []:
+        sev = (item.get("issue_severity") or "").lower()
+        conf = (item.get("issue_confidence") or "").lower()
+        # Map bandit's severity x confidence onto our two-level scheme.
+        # Only HIGH-severity HIGH-confidence becomes our "high".
+        if sev == "high" and conf in ("high", "medium"):
+            our_sev = "high"
+        elif sev in ("high", "medium"):
+            our_sev = "medium"
+        else:
+            continue
+        path = item.get("filename") or ""
+        try:
+            rel = os.path.relpath(path, workspace)
+        except Exception:
+            rel = path
+        findings.append(_SecFinding(
+            rule=f"bandit:{item.get('test_id', '?')}",
+            severity=our_sev,
+            file=rel,
+            line=int(item.get("line_number") or 0),
+            snippet=(item.get("code") or "").strip()[:200],
+            why=item.get("issue_text") or "",
+        ))
+    return findings
+
+
+def check_security(workspace: str, lang=None) -> list[CheckResult]:
+    """Static security scan — flag OWASP-class footguns the rest of the
+    pipeline doesn't see (hardcoded secrets, SQL injection, command
+    injection, weak crypto, JWT misconfig, XSS sinks, timing attacks).
+
+    Built-in regex patterns run always (zero deps). Augmented with `bandit`
+    on Python projects when bandit is on PATH.
+
+    HIGH severity → CheckResult error (fails the build).
+    MEDIUM severity → CheckResult warning (visible but doesn't block).
+    """
+    findings = _scan_for_security_issues(workspace, lang)
+    findings.extend(_try_bandit(workspace, lang))
+
+    if not findings:
+        return [CheckResult(
+            "security", True,
+            "no obvious security issues found in source",
+            severity="info",
+        )]
+
+    high = [f for f in findings if f.severity == "high"]
+    medium = [f for f in findings if f.severity == "medium"]
+    results: list[CheckResult] = []
+
+    def _format(group: list[_SecFinding], cap: int = 8) -> str:
+        lines: list[str] = []
+        for f in group[:cap]:
+            lines.append(f"  [{f.rule}] {f.file}:{f.line} — {f.why}")
+            if f.snippet:
+                lines.append(f"      > {f.snippet}")
+        if len(group) > cap:
+            lines.append(f"  …and {len(group) - cap} more")
+        return "\n".join(lines)
+
+    if high:
+        results.append(CheckResult(
+            "security", False,
+            f"{len(high)} HIGH-severity security issue(s) — fix before shipping:\n"
+            + _format(high),
+            severity="error",
+        ))
+    if medium:
+        results.append(CheckResult(
+            "security", False,
+            f"{len(medium)} MEDIUM-severity security issue(s):\n"
+            + _format(medium),
+            severity="warning",
+        ))
+    return results
+
+
 def run_validation(
     workspace: str,
     entry_point: str = "main.py",
     expected_packages: list[str] | None = None,
     lang=None,
 ) -> list[CheckResult]:
-    """Run the full validation pipeline (10 checks)."""
+    """Run the full validation pipeline (11 checks)."""
     results = []
     results.extend(check_stdlib_conflicts(workspace, lang))
     results.extend(check_imports(workspace, lang))
     results.extend(check_static_names(workspace, lang))   # catches NameErrors statically
     results.extend(check_syntax(workspace, lang))
     results.extend(check_lint(workspace, lang))
+    results.extend(check_security(workspace, lang))       # OWASP-class static scan
     results.extend(check_framework_conflicts(workspace, expected_packages=expected_packages, lang=lang))
     results.extend(check_functional_smoke(workspace, entry_point, lang))
     results.extend(check_entry_point(workspace, entry_point, lang))
@@ -2393,7 +2795,7 @@ def results_to_dict(results: list[CheckResult]) -> dict[str, bool | None]:
     """Convert results to a simple dict for progress tracking."""
     d: dict[str, bool | None] = {
         "naming": None, "imports": None, "static_names": None,
-        "syntax": None, "lint": None, "framework": None,
+        "syntax": None, "lint": None, "security": None, "framework": None,
         "functional": None, "run": None, "smoke_run": None, "tests": None,
     }
     for r in results:

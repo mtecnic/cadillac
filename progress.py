@@ -22,7 +22,8 @@ class Progress:
     dependencies: list[tuple[str, bool]] = field(default_factory=list)        # (name, installed)
     build_log: list[str] = field(default_factory=list)
     validation: dict[str, bool | None] = field(default_factory=lambda: {
-        "syntax": None, "lint": None, "framework": None, "functional": None, "run": None, "tests": None
+        "syntax": None, "lint": None, "security": None, "framework": None,
+        "functional": None, "run": None, "tests": None
     })
     lessons_applied: list[str] = field(default_factory=list)
 
