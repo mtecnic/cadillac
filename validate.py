@@ -1667,6 +1667,146 @@ def _wiring_discover_post_routes(workspace: str) -> list[str]:
     return routes
 
 
+def _wiring_concurrent_probe(port: int, synthetic_origin: str, workspace: str,
+                              results: list) -> str:
+    """Hammer the contract's parameterless GET endpoints concurrently.
+
+    Catches bug classes single-shot probes can't trigger:
+      - shared resource (SQLite conn, cache, in-memory state) accessed from
+        Werkzeug's per-request thread without locking
+      - lazy-init that races (two requests both observe `self._x is None`,
+        both initialize, last writer wins)
+      - lock-ordering deadlocks under contention
+      - connection-pool starvation surfacing as 500s
+
+    Appends an error CheckResult to `results` on any 5xx response or any
+    >5%-of-requests connection-error spike. Returns a one-line summary
+    suitable for inclusion in the success message.
+    """
+    import urllib.error
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time as _time
+
+    contract = None
+    try:
+        from .contracts import Contract
+        contract = Contract.load(workspace)
+    except Exception:
+        pass
+    if contract is None or contract.is_empty():
+        return ""
+
+    targets: list[str] = []
+    for ep in contract.endpoints:
+        if ep.method != "GET":
+            continue
+        if "<" in ep.path or "{" in ep.path or ":" in ep.path.lstrip("/"):
+            continue
+        targets.append(ep.path)
+        if len(targets) >= 5:
+            break
+    if not targets:
+        return ""
+
+    workers = 8
+    requests_per_target = 25
+    per_request_timeout = 5.0
+    stage_budget = 20.0
+
+    def _hit(path: str) -> tuple[str, int | None, str | None]:
+        url = f"http://127.0.0.1:{port}{path}"
+        try:
+            req = urllib.request.Request(
+                url, method="GET", headers={"Origin": synthetic_origin},
+            )
+            with urllib.request.urlopen(req, timeout=per_request_timeout) as r:
+                return (path, r.status, None)
+        except urllib.error.HTTPError as e:
+            return (path, e.code, None)
+        except Exception as e:
+            return (path, None, type(e).__name__)
+
+    five_xx_by_path: dict[str, int] = {}
+    error_by_path: dict[str, dict[str, int]] = {}
+    total_requests = 0
+    timed_out = False
+    started = _time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = []
+        for path in targets:
+            for _ in range(requests_per_target):
+                futures.append(pool.submit(_hit, path))
+        try:
+            for fut in as_completed(futures, timeout=stage_budget):
+                try:
+                    path, code, err = fut.result()
+                except Exception:
+                    continue
+                total_requests += 1
+                if code is not None and 500 <= code < 600:
+                    five_xx_by_path[path] = five_xx_by_path.get(path, 0) + 1
+                elif err is not None:
+                    # Connection refused, timeout, etc. — only flag if it's a
+                    # real spike, not the occasional close-then-reopen.
+                    error_by_path.setdefault(path, {})
+                    error_by_path[path][err] = error_by_path[path].get(err, 0) + 1
+        except TimeoutError:
+            # Stage budget exceeded — server is too slow to complete the load
+            # test. Probably saturated by what we're throwing at it; flag as
+            # warning rather than error so we don't false-positive on
+            # genuinely-slow-but-correct backends.
+            timed_out = True
+
+    elapsed = _time.monotonic() - started
+
+    failures: list[str] = []
+    if five_xx_by_path:
+        for path, count in five_xx_by_path.items():
+            failures.append(
+                f"GET {path}: {count}/{requests_per_target} requests returned 5xx"
+            )
+    # Connection-error spike threshold: >5% of a target's requests.
+    error_spike: list[str] = []
+    for path, errs in error_by_path.items():
+        total_errs = sum(errs.values())
+        if total_errs > requests_per_target * 0.05:
+            top_err = max(errs.items(), key=lambda kv: kv[1])
+            error_spike.append(
+                f"GET {path}: {total_errs}/{requests_per_target} connection errors "
+                f"(top: {top_err[0]} ×{top_err[1]})"
+            )
+
+    if failures:
+        results.append(CheckResult(
+            "wiring", False,
+            "Routes leaked 5xx under concurrent load (single-shot probes pass; "
+            "contention surfaces a thread-safety, locking, or shared-resource bug):\n  "
+            + "\n  ".join(failures),
+            severity="error",
+        ))
+    if error_spike:
+        results.append(CheckResult(
+            "wiring", False,
+            "Connection errors spiked under load (server may be deadlocking, "
+            "running out of workers, or crashing on contention):\n  "
+            + "\n  ".join(error_spike),
+            severity="warning",
+        ))
+    if timed_out:
+        results.append(CheckResult(
+            "wiring", True,  # warning, not failure — backend may just be slow
+            f"concurrent probe exceeded {stage_budget}s budget after {total_requests} "
+            f"of {len(targets) * requests_per_target} requests; server may be "
+            "saturated. Inspect manually if performance matters.",
+            severity="warning",
+        ))
+
+    return (f"{total_requests} concurrent GET requests across {len(targets)} "
+            f"endpoint(s) in {elapsed:.1f}s, no 5xx leaks")
+
+
 def _wiring_dynamic_checks(workspace: str, be: dict) -> list[CheckResult]:
     """Boot the backend and exercise it from a synthetic non-loopback Origin."""
     import socket
@@ -1854,11 +1994,29 @@ def _wiring_dynamic_checks(workspace: str, be: dict) -> list[CheckResult]:
                 severity="error",
             ))
 
+        # Probe 4: concurrency — hammer the contract's parameterless GET
+        # endpoints from many threads and watch for 5xx leaks. Single-shot
+        # probes pass when one request from one thread succeeds; this catches
+        # bugs that only surface under contention: a SQLite connection shared
+        # across Werkzeug request threads, a non-thread-safe global, a cache
+        # entry written without a lock. Runs ONLY if the previous probes
+        # found no errors — there's no point loading a server that's already
+        # 5xx'ing on a single request.
+        already_failing = any(
+            r.severity == "error" for r in results
+        )
+        concurrent_summary = ""
+        if not already_failing:
+            concurrent_summary = _wiring_concurrent_probe(
+                port, synthetic_origin, workspace, results
+            )
+
         if not results:
             return [CheckResult(
                 "wiring", True,
                 f"backend boots, CORS echoes non-loopback Origin, "
-                f"{len(post_routes)} POST route(s) return non-5xx on empty body",
+                f"{len(post_routes)} POST route(s) return non-5xx on empty body"
+                + (f", {concurrent_summary}" if concurrent_summary else ""),
                 severity="info",
             )]
         return results
