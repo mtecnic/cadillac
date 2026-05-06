@@ -233,6 +233,94 @@ def react_language() -> Language:
     )
 
 
+_GO_STDLIB = {
+    # The standard library is large; this set is for shadow/conflict
+    # detection. Listing the most likely shadowed names is enough — full
+    # stdlib coverage isn't needed and would add noise.
+    "fmt", "os", "io", "errors", "log", "time", "sync", "context",
+    "bytes", "strings", "strconv", "sort", "encoding", "regexp",
+    "bufio", "net", "http", "url", "path", "filepath", "math",
+    "reflect", "runtime", "unsafe", "syscall", "testing",
+}
+
+_RUST_STDLIB = {
+    # Same purpose as _GO_STDLIB — names a generated module/struct must NOT
+    # shadow. std + alloc + core paths in common use.
+    "std", "core", "alloc", "vec", "string", "result", "option",
+    "iter", "collections", "io", "fs", "net", "sync", "thread",
+    "time", "fmt", "error", "convert", "ops", "cmp", "boxed",
+}
+
+
+def go_language() -> Language:
+    """Create Language config for Go projects (modules-based, gofmt'd)."""
+    return Language(
+        name="go",
+        family="compiled",
+        extensions=[".go"],
+        entry_point="main.go",
+        init_file=None,
+        test_prefix="",
+        test_suffix="_test",
+        package_file="go.mod",
+        install_cmd="go mod tidy",
+        run_cmd="go run",
+        build_cmd="go build ./...",
+        test_cmd=["go", "test", "./..."],
+        lint_cmd=["go", "vet", "./..."],
+        syntax_check_cmd=["go", "build", "./..."],
+        stdlib_modules=_GO_STDLIB,
+        # Go imports: `import "path"` or `import ( "a"; "b" )`. We capture
+        # the path inside quotes; multi-line blocks are caught by repeated matches.
+        import_pattern=re.compile(r'^\s*(?:import\s+)?["]([^"]+)["]'),
+        fence_langs=["go"],
+        coding_standards=quality.GO_CODING_STANDARDS,
+        project_structure=quality.GO_PROJECT_STRUCTURE,
+        anti_patterns=quality.GO_ANTI_PATTERNS,
+        few_shot_scaffold=quality.GO_FEW_SHOT_SCAFFOLD,
+        few_shot_main=quality.GO_FEW_SHOT_MAIN,
+        few_shot_db_pattern=quality.GO_FEW_SHOT_DB_PATTERN,
+        functional_test_guidance=quality.GO_FUNCTIONAL_TEST_GUIDANCE,
+        few_shot_naming=quality.GO_FEW_SHOT_NAMING,
+        iterate_prompt=quality.GO_ITERATE_PROMPT,
+        iterate_feature_prompt=quality.GO_ITERATE_FEATURE_PROMPT,
+    )
+
+
+def rust_language() -> Language:
+    """Create Language config for Rust projects (Cargo, 2021 edition)."""
+    return Language(
+        name="rust",
+        family="compiled",
+        extensions=[".rs"],
+        entry_point="src/main.rs",
+        init_file=None,
+        test_prefix="",
+        test_suffix="",
+        package_file="Cargo.toml",
+        install_cmd="cargo fetch",
+        run_cmd="cargo run --",
+        build_cmd="cargo build",
+        test_cmd=["cargo", "test"],
+        lint_cmd=["cargo", "clippy", "--", "-D", "warnings"],
+        syntax_check_cmd=["cargo", "check"],
+        stdlib_modules=_RUST_STDLIB,
+        # Rust: `use foo::bar::Baz;` or `use foo::*;`. Capture the root crate.
+        import_pattern=re.compile(r'^\s*use\s+([A-Za-z_][A-Za-z0-9_:]*)'),
+        fence_langs=["rust"],
+        coding_standards=quality.RUST_CODING_STANDARDS,
+        project_structure=quality.RUST_PROJECT_STRUCTURE,
+        anti_patterns=quality.RUST_ANTI_PATTERNS,
+        few_shot_scaffold=quality.RUST_FEW_SHOT_SCAFFOLD,
+        few_shot_main=quality.RUST_FEW_SHOT_MAIN,
+        few_shot_db_pattern=quality.RUST_FEW_SHOT_DB_PATTERN,
+        functional_test_guidance=quality.RUST_FUNCTIONAL_TEST_GUIDANCE,
+        few_shot_naming=quality.RUST_FEW_SHOT_NAMING,
+        iterate_prompt=quality.RUST_ITERATE_PROMPT,
+        iterate_feature_prompt=quality.RUST_ITERATE_FEATURE_PROMPT,
+    )
+
+
 def electron_language() -> Language:
     """Create Language config for Electron + React + TypeScript desktop apps.
 
@@ -396,6 +484,16 @@ _PYTHON_KEYWORDS = frozenset({
     ".py", "main.py", "requirements.txt",
 })
 
+_GO_KEYWORDS = frozenset({
+    "golang", "go module", "go service", "go cli", "go binary",
+    "go.mod", "gofmt", "goroutine", "go test",
+})
+
+_RUST_KEYWORDS = frozenset({
+    "rust", "cargo", "rustc", "rust crate", "cargo.toml", "rust binary",
+    "rust library", "tokio", "serde",
+})
+
 
 def detect_language(task: str, workspace: str | None = None) -> Language:
     """Detect target language from task description or existing workspace."""
@@ -407,6 +505,15 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
         if not any(kw in task_lower for kw in _FRAMEWORK_KEYWORDS):
             if not any(kw in task_lower for kw in _PYTHON_KEYWORDS):
                 return html_language()
+
+    # Compiled-language detection — check BEFORE Python/JS so a task that
+    # mentions "rust web service" or "go cli with serde" routes correctly.
+    # Use word-boundary checks for "rust" / "go" to avoid false positives
+    # ("trustpilot" → rust, "go to" → go).
+    if any(re.search(rf"\b{re.escape(kw)}\b", task_lower) for kw in _RUST_KEYWORDS):
+        return rust_language()
+    if any(re.search(rf"\b{re.escape(kw)}\b", task_lower) for kw in _GO_KEYWORDS):
+        return go_language()
 
     # Framework-specific detection — check BEFORE generic JS/TS.
     # Electron must come BEFORE react: a task like "electron + react desktop

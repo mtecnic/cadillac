@@ -2027,3 +2027,466 @@ CURRENT ISSUES:
 {instruction}
 
 {code_map}"""
+
+
+# ── Go ───────────────────────────────────────────────────────────────────────
+
+GO_CODING_STANDARDS = """\
+## Coding Standards (apply to ALL generated code)
+- Standard layout: cmd/<binary>/main.go for binaries; pkg/ for exported,
+  internal/ for unexported library code
+- go.mod at repo root; use modules (NOT GOPATH-style)
+- One package per directory; package name matches the dir
+- Errors are values: return `(T, error)`. NEVER `panic` outside `init` or truly
+  unrecoverable startup failure. Wrap with `fmt.Errorf("...: %w", err)`.
+- gofmt on every file — no exceptions
+- Exported names start with capital. Use them sparingly; prefer narrow public surface.
+- context.Context as first arg for any function that does I/O or can be cancelled
+- Avoid global state. Pass dependencies through structs/interfaces.
+- Use `t.Run(name, func(t *testing.T) {...})` subtests over giant table-driven
+  loops when setup differs per case.
+- Concurrency: goroutines must have a clear lifecycle (started by X, stopped
+  by Y). NEVER `go f()` without a way to wait for it or cancel via context."""
+
+GO_PROJECT_STRUCTURE = """\
+## Project Structure Guidelines (Go modules)
+
+**CLI tool / single binary**:
+```
+go.mod                           # module declaration
+go.sum
+main.go                          # if simple — just package main + main()
+cmd/<binary>/main.go             # if multi-binary or growing
+internal/<feature>/<feature>.go  # private library code
+internal/<feature>/<feature>_test.go
+```
+
+**Service (HTTP/gRPC)**:
+```
+go.mod
+cmd/server/main.go               # bootstrapping only — config + server.New()
+internal/server/server.go        # http handlers, wiring
+internal/<domain>/...            # business logic per domain
+internal/storage/                # DB layer (sqlx, gorm, raw database/sql)
+```
+
+**Test files** live alongside their target: `foo.go` + `foo_test.go` in the
+same package. Use `package foo_test` for black-box tests, `package foo` for
+white-box tests that need internals.
+
+**go.mod** must declare the module path (e.g., `module example.com/myapp`)
+and a Go version (`go 1.22`). Dependencies are added via `go get` or by
+editing the require block."""
+
+GO_ANTI_PATTERNS = """\
+## NEVER Do These (Go mistakes)
+- NEVER use `panic` outside `init()` or unrecoverable startup. Return errors.
+- NEVER ignore errors with `_, _ = foo()` or bare `foo()`. Handle every error.
+- NEVER start a goroutine without a way to stop it (context cancel, channel close)
+- NEVER use `time.Sleep` in tests as a "wait for goroutine" mechanism — use channels
+- NEVER share a `sync.WaitGroup` by value — pass `*sync.WaitGroup`
+- NEVER mutate a map concurrently without sync.Mutex / sync.RWMutex / sync.Map
+- NEVER call `os.Exit` from a library — only from `main`
+- NEVER use the empty interface `interface{}` (or `any`) as a return type
+  if you can return a concrete type; it forces type-switches at every call site
+- NEVER capture loop variables by reference in goroutines:
+  `for _, v := range xs { go func() { use(v) }() }` — bind explicitly:
+  `for _, v := range xs { v := v; go func() { use(v) }() }`"""
+
+GO_FEW_SHOT_SCAFFOLD = """\
+## Example: writing a Go package with tests
+```
+write_file("internal/counter/counter.go", `package counter
+
+import "sync"
+
+type Counter struct {
+    mu sync.Mutex
+    n  int
+}
+
+func New() *Counter { return &Counter{} }
+
+func (c *Counter) Inc() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.n++
+}
+
+func (c *Counter) Value() int {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return c.n
+}
+`)
+
+write_file("internal/counter/counter_test.go", `package counter
+
+import (
+    "sync"
+    "testing"
+)
+
+func TestInc(t *testing.T) {
+    c := New()
+    c.Inc(); c.Inc(); c.Inc()
+    if got := c.Value(); got != 3 { t.Fatalf("want 3, got %d", got) }
+}
+
+func TestConcurrentInc(t *testing.T) {
+    c := New()
+    var wg sync.WaitGroup
+    for i := 0; i < 100; i++ {
+        wg.Add(1)
+        go func() { defer wg.Done(); c.Inc() }()
+    }
+    wg.Wait()
+    if got := c.Value(); got != 100 { t.Fatalf("want 100, got %d", got) }
+}
+`)
+```"""
+
+GO_FEW_SHOT_MAIN = """\
+## Example: cmd/<binary>/main.go (entry point)
+```go
+package main
+
+import (
+    "context"
+    "flag"
+    "fmt"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "example.com/myapp/internal/server"
+)
+
+func main() {
+    test := flag.Bool("test", false, "run smoke test then exit")
+    addr := flag.String("addr", ":8080", "listen address")
+    flag.Parse()
+
+    if *test {
+        fmt.Println("smoke ok")
+        return
+    }
+
+    ctx, cancel := signal.NotifyContext(context.Background(),
+        os.Interrupt, syscall.SIGTERM)
+    defer cancel()
+
+    if err := server.Run(ctx, *addr); err != nil {
+        log.Fatalf("server: %v", err)
+    }
+}
+```"""
+
+GO_FEW_SHOT_DB_PATTERN = """\
+## Persistence in Go — common patterns
+
+### SQLite via `mattn/go-sqlite3` and `database/sql`
+```go
+import (
+    "database/sql"
+    _ "github.com/mattn/go-sqlite3"
+)
+
+db, err := sql.Open("sqlite3", "data.db")
+if err != nil { return err }
+defer db.Close()
+
+if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)`); err != nil {
+    return err
+}
+
+rows, err := db.QueryContext(ctx, "SELECT id, body FROM notes WHERE id=?", id)
+```
+
+Always use parameter placeholders (`?`) — NEVER concatenate user input into SQL."""
+
+GO_FUNCTIONAL_TEST_GUIDANCE = """\
+## Go testing (`go test`)
+- Test files end in `_test.go`, in the same package as the code under test
+- Test functions: `func TestXxx(t *testing.T)` — start with capital `Test`
+- `t.Fatalf` to fail and stop; `t.Errorf` to fail and continue
+- Subtests: `t.Run("name", func(t *testing.T) {...})`
+- Table-driven tests for many cases:
+  ```go
+  for _, tc := range []struct {
+      name string; in int; want int
+  }{
+      {"zero", 0, 0}, {"one", 1, 2},
+  } {
+      t.Run(tc.name, func(t *testing.T) {
+          if got := double(tc.in); got != tc.want { t.Fatalf("...") }
+      })
+  }
+  ```
+- Race detection: `go test -race ./...` — run for any concurrent code
+- Don't `t.Parallel()` tests that share global state"""
+
+GO_FEW_SHOT_NAMING = """\
+## Naming conventions
+- Packages: lowercase, single word: `auth`, `storage`, `server`. NOT `myAuth` or `auth_pkg`.
+- Exported types/functions: PascalCase: `Counter`, `NewServer`
+- Unexported: camelCase: `bufferSize`, `parseConfig`
+- Files: lowercase, underscores OK for clarity: `user_repo.go`, `counter_test.go`
+- Interfaces: usually `-er` suffix when single-method: `Reader`, `Closer`, `Stringer`
+- Receivers: short, consistent: `c *Counter`, `s *Server`. Same name in every method.
+- Errors: variables prefixed `Err`: `ErrNotFound`. Sentinel errors at package level."""
+
+GO_ITERATE_PROMPT = """\
+You are iterating on a Go project.
+
+Tools: edit_file, write_file, line_edit, run_command, read_file.
+
+Rules:
+- Run `go build ./...` after edits to catch compile errors
+- Run `go test ./...` to verify; `go test -race ./...` for concurrent code
+- Run `go vet ./...` — silence each warning legitimately, don't suppress
+- Errors are values: every err must be checked, wrapped with %w if rethrown
+- gofmt the result (or use `goimports`)
+
+CURRENT ISSUES:
+{validation_failures}
+
+{code_map}"""
+
+GO_ITERATE_FEATURE_PROMPT = """\
+Implement the requested feature in the existing Go module.
+- Keep the package layout (cmd/, internal/, pkg/) consistent
+- Add tests in <feature>_test.go — at least one happy path + one error path
+- After: `go build ./... && go test ./... && go vet ./...` must pass
+
+CURRENT ISSUES:
+{validation_failures}
+
+{instruction}
+
+{code_map}"""
+
+
+# ── Rust ─────────────────────────────────────────────────────────────────────
+
+RUST_CODING_STANDARDS = """\
+## Coding Standards (apply to ALL generated code)
+- Cargo.toml at repo root; src/main.rs (binary) or src/lib.rs (library) or both
+- 2024 edition; pin a recent stable rustc version
+- Use `Result<T, E>` for fallible operations. NEVER `unwrap()` outside tests
+  or "this can't fail because ..." with a comment proving it
+- Errors: use `thiserror` for library error types, `anyhow` for application
+  binaries. Wrap lower-level errors with `.context("doing X")` (anyhow) or
+  `#[from]` (thiserror).
+- Ownership first: prefer `&str` over `String`, `&[T]` over `Vec<T>` in
+  function signatures. Take ownership (`String`, `Vec<T>`) only when the
+  function needs it.
+- `#[derive(Debug)]` on every public struct/enum. `Clone` only when needed.
+- Lifetimes: name them when they convey intent (`'a` for "lives as long as
+  the input"). Don't fight the borrow checker — restructure.
+- async: use `tokio` (most common) and `async fn`. Don't mix `tokio::spawn`
+  with non-tokio runtimes.
+- Tests in same file under `#[cfg(test)] mod tests { ... }` for unit tests,
+  `tests/` directory for integration tests.
+- `cargo fmt` and `cargo clippy -- -D warnings` on every commit."""
+
+RUST_PROJECT_STRUCTURE = """\
+## Project Structure Guidelines (Cargo)
+
+**Binary**:
+```
+Cargo.toml
+Cargo.lock
+src/
+    main.rs                  # binary entry — clap parsing + call into lib
+    lib.rs                   # public API (if also publishing as lib)
+    <module>/mod.rs          # OR <module>.rs — pick one style and stick to it
+    <module>/<sub>.rs
+tests/
+    integration_test.rs      # tests against the public lib API
+```
+
+**Library only**:
+```
+Cargo.toml
+src/lib.rs                   # `pub use` the things you mean to export
+src/internal.rs              # private modules (no `pub`)
+tests/
+```
+
+**Cargo.toml minimum**:
+```toml
+[package]
+name = "myapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# add via `cargo add <crate>` or here directly with version pins
+
+[dev-dependencies]
+# only used in tests/benches
+```"""
+
+RUST_ANTI_PATTERNS = """\
+## NEVER Do These (Rust mistakes)
+- NEVER `unwrap()` / `expect()` on a Result/Option in production code paths.
+  In tests it's fine; in main code, propagate with `?` or handle the None/Err.
+- NEVER `clone()` to silence the borrow checker — restructure ownership instead
+- NEVER block on async code with `block_on` in async contexts (deadlocks runtime)
+- NEVER use `unsafe` without a comment explaining the invariant being upheld
+- NEVER hold a `MutexGuard` across an `.await` — use `tokio::sync::Mutex` or release before awaiting
+- NEVER `Box<dyn Trait>` reflexively — prefer concrete types or generics with bounds
+- NEVER `String::from_utf8_unchecked` on input you didn't validate
+- NEVER ignore `#[must_use]` warnings (they exist because the value matters)
+- NEVER write `.unwrap_or_default()` without thinking — sometimes silently swallowing an error is wrong"""
+
+RUST_FEW_SHOT_SCAFFOLD = """\
+## Example: writing a Rust module with tests
+```
+write_file("src/counter.rs", `use std::sync::Mutex;
+
+pub struct Counter {
+    inner: Mutex<i64>,
+}
+
+impl Counter {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(0) }
+    }
+
+    pub fn inc(&self) {
+        let mut n = self.inner.lock().expect("counter mutex poisoned");
+        *n += 1;
+    }
+
+    pub fn value(&self) -> i64 {
+        *self.inner.lock().expect("counter mutex poisoned")
+    }
+}
+
+impl Default for Counter {
+    fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inc_increments() {
+        let c = Counter::new();
+        c.inc(); c.inc(); c.inc();
+        assert_eq!(c.value(), 3);
+    }
+
+    #[test]
+    fn default_is_zero() {
+        let c = Counter::default();
+        assert_eq!(c.value(), 0);
+    }
+}
+`)
+```"""
+
+RUST_FEW_SHOT_MAIN = """\
+## Example: src/main.rs (binary entry)
+```rust
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--test") {
+        println!("smoke ok");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(e) = run(&args) {
+        eprintln!("error: {e:#}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn run(_args: &[String]) -> anyhow::Result<()> {
+    // ...
+    Ok(())
+}
+```"""
+
+RUST_FEW_SHOT_DB_PATTERN = """\
+## Persistence in Rust — common choices
+
+### SQLite via `rusqlite`
+```rust
+use rusqlite::{Connection, params};
+
+let conn = Connection::open("data.db")?;
+conn.execute(
+    "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
+    [],
+)?;
+conn.execute("INSERT INTO notes (body) VALUES (?1)", params![body])?;
+
+// Always use parameter placeholders. NEVER format!() user input into SQL.
+```
+
+### Async + Postgres via `sqlx`
+```rust
+let pool = sqlx::postgres::PgPoolOptions::new().connect(&url).await?;
+let row: (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+    .bind(email)
+    .fetch_one(&pool).await?;
+```"""
+
+RUST_FUNCTIONAL_TEST_GUIDANCE = """\
+## Rust testing (`cargo test`)
+- Unit tests: `#[cfg(test)] mod tests { use super::*; #[test] fn it_works() {} }`
+- Integration tests: separate files in `tests/` — they import the lib's public API only
+- `assert_eq!`, `assert!`, `assert_ne!` for assertions
+- `#[should_panic(expected = "msg")]` for panics
+- `#[ignore]` to skip slow tests; run with `cargo test -- --ignored`
+- Concurrent code: `cargo test --release` to validate under optimizer; consider
+  `loom` for systematic concurrency testing of small primitives
+- `proptest` / `quickcheck` for property-based tests when the domain has
+  invariants (e.g., serialize/deserialize roundtrip, sort idempotence)"""
+
+RUST_FEW_SHOT_NAMING = """\
+## Naming conventions (idiomatic Rust)
+- Modules / files: snake_case: `user_repo.rs`, `mod parser`
+- Types / traits: PascalCase: `Counter`, `Display`, `IntoIterator`
+- Functions / variables / methods: snake_case: `fn parse_input`, `let max_size`
+- Constants: SCREAMING_SNAKE_CASE: `const MAX_BUFFER: usize = 1024;`
+- Lifetimes: lowercase, often single letter: `'a`, `'src`
+- Crate names: kebab-case in Cargo.toml (`my-crate`), snake_case in code (`my_crate`)"""
+
+RUST_ITERATE_PROMPT = """\
+You are iterating on a Rust project.
+
+Tools: edit_file, write_file, line_edit, run_command, read_file.
+
+Rules:
+- Run `cargo build` to catch compile errors first
+- Run `cargo test` to verify
+- Run `cargo clippy -- -D warnings` — fix every clippy lint legitimately
+- Use `?` for error propagation, not `.unwrap()`
+- If the borrow checker fights you, restructure ownership; don't add `.clone()` reflexively
+
+CURRENT ISSUES:
+{validation_failures}
+
+{code_map}"""
+
+RUST_ITERATE_FEATURE_PROMPT = """\
+Implement the requested feature in the existing Cargo project.
+- Keep module layout consistent (lib.rs / module structure)
+- Add tests: unit tests in #[cfg(test)] mod tests, integration in tests/
+- Update Cargo.toml [dependencies] if you need a new crate (use cargo add)
+- After: `cargo build && cargo test && cargo clippy -- -D warnings` must pass
+
+CURRENT ISSUES:
+{validation_failures}
+
+{instruction}
+
+{code_map}"""
