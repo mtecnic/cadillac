@@ -252,6 +252,95 @@ _RUST_STDLIB = {
 }
 
 
+def wordpress_language() -> Language:
+    """Create Language config for WordPress plugins (PHP).
+
+    Family is "php" — a new family. Validation hooks (check_syntax,
+    check_security) recognize the family and dispatch a php-aware code
+    path. WP plugins can't be RUN without a real WordPress install, so
+    the entry-point check just verifies the main plugin file exists.
+    """
+    return Language(
+        name="wordpress",
+        family="php",
+        extensions=[".php"],
+        # The plugin's main file is named after the slug. We can't know
+        # the slug at construction time, so use a generic placeholder; the
+        # real entry is whichever .php at workspace root carries the
+        # WP "Plugin Name:" header.
+        entry_point="plugin.php",
+        init_file=None,
+        test_prefix="",
+        test_suffix="Test",  # PHPUnit convention: ClassName + "Test"
+        package_file=None,   # composer.json optional, not required
+        install_cmd="",      # WP plugins install by file copy
+        run_cmd="",          # can't run without a WP host
+        build_cmd="",        # no build step
+        test_cmd=["phpunit"],   # run iff phpunit is installed; harmless skip otherwise
+        lint_cmd=None,
+        syntax_check_cmd=["php", "-l"],
+        stdlib_modules=set(),  # PHP doesn't have a Python-style stdlib namespace
+        import_pattern=re.compile(
+            r'^\s*(?:require|require_once|include|include_once|use)\s+([^\s;]+)'
+        ),
+        fence_langs=["php"],
+        coding_standards=quality.WORDPRESS_CODING_STANDARDS,
+        project_structure=quality.WORDPRESS_PROJECT_STRUCTURE,
+        anti_patterns=quality.WORDPRESS_ANTI_PATTERNS,
+        few_shot_scaffold=quality.WORDPRESS_FEW_SHOT_SCAFFOLD,
+        few_shot_main=quality.WORDPRESS_FEW_SHOT_MAIN,
+        few_shot_db_pattern=quality.WORDPRESS_FEW_SHOT_DB_PATTERN,
+        functional_test_guidance=quality.WORDPRESS_FUNCTIONAL_TEST_GUIDANCE,
+        few_shot_naming=quality.WORDPRESS_FEW_SHOT_NAMING,
+        iterate_prompt=quality.WORDPRESS_ITERATE_PROMPT,
+        iterate_feature_prompt=quality.WORDPRESS_ITERATE_FEATURE_PROMPT,
+    )
+
+
+def browser_extension_language() -> Language:
+    """Create Language config for Chrome MV3 browser extensions (TS + Vite).
+
+    Same node toolchain as react_language() — same vite/vitest/tsc/eslint —
+    plus an MV3 manifest, service-worker background, content scripts, and
+    optionally a React popup. Extension can't actually be loaded into
+    Chrome here (we're headless), so smoke/run skip; we validate the bundle
+    compiles and unit tests pass.
+    """
+    return Language(
+        name="browser_extension",
+        family="node",
+        extensions=[".ts", ".tsx", ".js", ".jsx", ".json", ".html", ".css"],
+        entry_point="manifest.json",
+        init_file="index.ts",
+        test_prefix="",
+        test_suffix=".test",
+        package_file="package.json",
+        install_cmd="npm install",
+        run_cmd="",            # can't run headless; skipped in entry-point check
+        build_cmd="npx vite build",
+        test_cmd=["npx", "vitest", "run"],
+        lint_cmd=["npx", "eslint", "."],
+        syntax_check_cmd=["npx", "tsc", "--noEmit"],
+        stdlib_modules=_NODE_BUILTINS,
+        import_pattern=re.compile(
+            r'''^\s*(?:import\s+.*?\s+from\s+['"]([^'"]+)['"]'''
+            r'''|import\s+['"]([^'"]+)['"]'''
+            r'''|(?:const|let|var)\s+.*?=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\))'''
+        ),
+        fence_langs=["typescript", "tsx", "javascript", "json"],
+        coding_standards=quality.BROWSER_EXT_CODING_STANDARDS,
+        project_structure=quality.BROWSER_EXT_PROJECT_STRUCTURE,
+        anti_patterns=quality.BROWSER_EXT_ANTI_PATTERNS,
+        few_shot_scaffold=quality.BROWSER_EXT_FEW_SHOT_SCAFFOLD,
+        few_shot_main=quality.BROWSER_EXT_FEW_SHOT_MAIN,
+        few_shot_db_pattern=quality.BROWSER_EXT_FEW_SHOT_DB_PATTERN,
+        functional_test_guidance=quality.BROWSER_EXT_FUNCTIONAL_TEST_GUIDANCE,
+        few_shot_naming=quality.BROWSER_EXT_FEW_SHOT_NAMING,
+        iterate_prompt=quality.BROWSER_EXT_ITERATE_PROMPT,
+        iterate_feature_prompt=quality.BROWSER_EXT_ITERATE_FEATURE_PROMPT,
+    )
+
+
 def go_language() -> Language:
     """Create Language config for Go projects (modules-based, gofmt'd)."""
     return Language(
@@ -489,6 +578,17 @@ _GO_KEYWORDS = frozenset({
     "go.mod", "gofmt", "goroutine", "go test",
 })
 
+_WORDPRESS_KEYWORDS = frozenset({
+    "wordpress", "wp plugin", "wordpress plugin", "wp-plugin",
+    "wp.org", "wp_", "wp shortcode", "wp admin", "gutenberg block",
+})
+
+_BROWSER_EXT_KEYWORDS = frozenset({
+    "browser extension", "chrome extension", "firefox extension",
+    "web extension", "manifest v3", "mv3", "chrome plugin",
+    "browser plugin", "extension popup",
+})
+
 _RUST_KEYWORDS = frozenset({
     "rust", "cargo", "rustc", "rust crate", "cargo.toml", "rust binary",
     "rust library", "tokio", "serde",
@@ -505,6 +605,15 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
         if not any(kw in task_lower for kw in _FRAMEWORK_KEYWORDS):
             if not any(kw in task_lower for kw in _PYTHON_KEYWORDS):
                 return html_language()
+
+    # Platform-specific detection — check BEFORE generic frameworks.
+    # Browser extension / WordPress are NOT just React or PHP apps; they
+    # have specific manifests/structure. Word-boundary regex per keyword
+    # so "extension" embedded in "extensible" doesn't false-trigger.
+    if any(re.search(rf"\b{re.escape(kw)}\b", task_lower) for kw in _WORDPRESS_KEYWORDS):
+        return wordpress_language()
+    if any(re.search(rf"\b{re.escape(kw)}\b", task_lower) for kw in _BROWSER_EXT_KEYWORDS):
+        return browser_extension_language()
 
     # Compiled-language detection — check BEFORE Python/JS so a task that
     # mentions "rust web service" or "go cli with serde" routes correctly.

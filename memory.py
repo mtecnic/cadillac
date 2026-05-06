@@ -17,9 +17,10 @@ PHASE_HISTORY_PATH = os.path.join(MEMORY_DIR, "phase_budgets.jsonl")
 _KNOWN_TAGS = {
     "python", "typescript", "javascript", "react", "vue", "angular",
     "electron", "desktop", "go", "golang", "rust", "cargo", "tokio",
+    "wordpress", "plugin", "php", "browser", "extension", "chrome", "mv3",
     "html", "css", "node", "flask", "django", "fastapi", "express",
     "pygame", "click", "asyncio", "aiosqlite", "sqlite", "pytest",
-    "vitest", "jest", "modular", "flat",
+    "vitest", "jest", "phpunit", "modular", "flat",
     "plan", "deps", "scaffold", "review", "build", "integrate", "wiring", "validate", "package",
 }
 

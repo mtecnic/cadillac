@@ -140,6 +140,8 @@ def check_syntax(workspace: str, lang=None) -> list[CheckResult]:
         return _check_syntax_ts(workspace)
     if lang and lang.family == "static":
         return _check_syntax_html(workspace)
+    if lang and lang.family == "php":
+        return _check_syntax_php(workspace)
     results = []
     for root, _, files in os.walk(workspace):
         # Skip __pycache__ and .venv
@@ -153,6 +155,40 @@ def check_syntax(workspace: str, lang=None) -> list[CheckResult]:
             r = _run(["python3", "-m", "py_compile", path], cwd=workspace, timeout=10)
             if r.returncode != 0:
                 results.append(CheckResult("syntax", False, f"{rel}: {r.stderr.strip()[:300]}"))
+    if not results:
+        results.append(CheckResult("syntax", True))
+    return results
+
+
+def _check_syntax_php(workspace: str) -> list[CheckResult]:
+    """Lint every .php file with `php -l`. Skips cleanly if php isn't on PATH.
+
+    WP plugins can't be RUN here (no WordPress install), but `php -l` is a
+    cheap, isolated parser check that catches the common bug class:
+    syntax errors, unmatched braces, missing semicolons. It does NOT
+    catch type errors or undefined functions — that's PHPStan / Psalm
+    territory, future work.
+    """
+    import shutil
+    if not shutil.which("php"):
+        return [CheckResult(
+            "syntax", True,
+            "php not installed; PHP syntax check skipped (install php to enable)",
+            severity="info",
+        )]
+    results: list[CheckResult] = []
+    skip = {"vendor", "node_modules", ".git", "__pycache__"}
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for f in files:
+            if not f.endswith(".php"):
+                continue
+            path = os.path.join(root, f)
+            rel = os.path.relpath(path, workspace)
+            r = _run(["php", "-l", path], cwd=workspace, timeout=10)
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout).strip()[:300]
+                results.append(CheckResult("syntax", False, f"{rel}: {err}"))
     if not results:
         results.append(CheckResult("syntax", True))
     return results
@@ -195,7 +231,7 @@ def check_lint(workspace: str, lang=None) -> list[CheckResult]:
     """Run linter."""
     if lang and lang.family == "node":
         return _check_lint_ts(workspace)
-    if lang and lang.family in ("static", "compiled"):
+    if lang and lang.family in ("static", "compiled", "php"):
         return [CheckResult("lint", True, f"No linter for {lang.name}, skipped", "info")]
     r = _run(["ruff", "check", "--select=E,F,W", workspace], cwd=workspace, timeout=30)
     if "No such file" in r.stderr:
@@ -552,8 +588,17 @@ def check_entry_point(workspace: str, entry_point: str = "main.py", lang=None) -
     if lang and lang.family == "static":
         return [CheckResult("run", True, f"Entry point {entry_point} exists")]
 
+    # PHP / WordPress plugins: can't run without a WordPress install.
+    # The main plugin file existing + php -l clean (handled by check_syntax)
+    # is the strongest signal we can give here.
+    if lang and lang.family == "php":
+        return [CheckResult("run", True,
+                            "php-family project — entry point exists, "
+                            "deferred to host environment for execution",
+                            severity="info")]
+
     # Framework projects (React/Vue/Angular): entry point is a DOM mount, not executable
-    if lang and lang.name in ("react", "vue", "angular", "electron"):
+    if lang and lang.name in ("react", "vue", "angular", "electron", "browser_extension"):
         if lang.build_cmd:
             node_dir = _find_node_project_dir(workspace)
             cmd = _npx_no_install(lang.build_cmd.split())
@@ -632,6 +677,10 @@ def check_tests(workspace: str, lang=None) -> list[CheckResult]:
         return _check_tests_ts(workspace, lang)
     if lang and lang.family == "static":
         return _check_tests_html(workspace)
+    if lang and lang.family == "php":
+        return _check_tests_php(workspace)
+    if lang and lang.family == "compiled":
+        return _check_tests_compiled(workspace, lang)
 
     test_files = []
     for root, _, files in os.walk(workspace):
@@ -654,6 +703,44 @@ def check_tests(workspace: str, lang=None) -> list[CheckResult]:
 
     output = (r.stdout + "\n" + r.stderr).strip()[-1500:]
     return [CheckResult("tests", False, output)]
+
+
+def _check_tests_php(workspace: str) -> list[CheckResult]:
+    """Run PHPUnit if it's available and there are tests; skip cleanly otherwise.
+
+    WP plugins typically ship pure-logic unit tests in tests/ separate from
+    the WP-integration test scaffold (which needs a real WP install).
+    """
+    import shutil
+    has_tests_dir = os.path.isdir(os.path.join(workspace, "tests"))
+    if not has_tests_dir:
+        return [CheckResult("tests", True,
+                            "no tests/ directory; PHPUnit skipped (add tests/ + "
+                            "phpunit.xml to enable)",
+                            severity="info")]
+    if not shutil.which("phpunit"):
+        return [CheckResult("tests", True,
+                            "PHPUnit not installed; pure-logic tests in tests/ "
+                            "won't be run on this host",
+                            severity="info")]
+    r = _run(["phpunit", "--colors=never"], cwd=workspace, timeout=60)
+    if r.returncode == 0:
+        return [CheckResult("tests", True)]
+    return [CheckResult("tests", False,
+                        ((r.stdout or "") + (r.stderr or "")).strip()[-1500:])]
+
+
+def _check_tests_compiled(workspace: str, lang) -> list[CheckResult]:
+    """Run the language's native test command for compiled-family projects."""
+    if not lang.test_cmd:
+        return [CheckResult("tests", True,
+                            f"no test_cmd configured for {lang.name}; skipped",
+                            severity="info")]
+    r = _run(list(lang.test_cmd), cwd=workspace, timeout=120)
+    if r.returncode == 0:
+        return [CheckResult("tests", True)]
+    return [CheckResult("tests", False,
+                        ((r.stdout or "") + (r.stderr or "")).strip()[-1500:])]
 
 
 def _check_tests_html(workspace: str) -> list[CheckResult]:
@@ -805,7 +892,7 @@ def check_imports(workspace: str, lang=None) -> list[CheckResult]:
     """Check that all imports can be resolved."""
     if lang and lang.family == "node":
         return _check_imports_ts(workspace)
-    if lang and lang.family in ("static", "compiled"):
+    if lang and lang.family in ("static", "compiled", "php"):
         return [CheckResult("imports", True, f"{lang.name} — import check skipped", "info")]
 
     local_modules = set()
@@ -1349,8 +1436,8 @@ def check_framework_conflicts(
     """
     framework_files: dict[str, list[str]] = {}  # framework -> list of files using it
 
-    if lang and lang.family in ("static", "compiled"):
-        # Static/compiled: no framework conflicts to check
+    if lang and lang.family in ("static", "compiled", "php"):
+        # Static/compiled/php: no framework conflicts to check
         return [CheckResult("framework", True)]
 
     if lang and lang.family == "node":
