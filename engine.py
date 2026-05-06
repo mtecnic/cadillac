@@ -3781,6 +3781,41 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             emit("log", msg=f"  [WARN] {w.name}: {(w.output or '')[:200]}")
                     else:
                         emit("log", msg="[All validations passed!]")
+                    # Adversarial test pass: a SECOND LLM turn writes tests
+                    # designed to break the first LLM's implementation,
+                    # specifically targeting the "LLM tests its own code"
+                    # blind spot. v1 is advisory — findings surface in the
+                    # log but don't block the pipeline. False positives are
+                    # likely (LLM may probe APIs the impl doesn't promise);
+                    # we'll promote to blocking once we have telemetry.
+                    if getattr(cfg, "enable_adversarial_tests", True):
+                        try:
+                            from .adversarial import run_adversarial_tests
+                            adv = run_adversarial_tests(workspace, lang, cfg, emit)
+                            if adv.skipped_reason:
+                                emit("log", msg=f"[ADVERSARIAL] skipped — {adv.skipped_reason}")
+                            elif adv.passed:
+                                emit("log", msg=(
+                                    f"[ADVERSARIAL] passed — {adv.n_tests_run} "
+                                    f"adversarial tests all passed"
+                                ))
+                            else:
+                                emit("log", msg=(
+                                    f"[ADVERSARIAL] {adv.n_failed}/{adv.n_tests_run} "
+                                    "adversarial tests failed (advisory — not blocking):"
+                                ))
+                                for f in adv.failures[:5]:
+                                    emit("log", msg=f"  [adv] {f[:200]}")
+                                if adv.test_file_path:
+                                    rel = os.path.relpath(adv.test_file_path, workspace)
+                                    emit("log", msg=(
+                                        f"  Generated tests at {rel} — review and "
+                                        "either fix the implementation or delete tests "
+                                        "that probe behavior the impl doesn't promise."
+                                    ))
+                        except Exception as _e:
+                            # Adversarial is advisory. Never let it break a build.
+                            emit("log", msg=f"[ADVERSARIAL] crashed (advisory; ignored): {_e}")
                     progress.log("Validation passed" + (
                         f" ({len(warnings_list)} warning(s))" if warnings_list else ""
                     ))
