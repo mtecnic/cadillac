@@ -3088,3 +3088,331 @@ CURRENT ISSUES:
 {instruction}
 
 {code_map}"""
+
+
+# ── PyTorch / GPU ML ─────────────────────────────────────────────────────────
+
+PYTORCH_CODING_STANDARDS = """\
+## Coding Standards (apply to ALL generated code)
+- Device discipline: pick a device once at the top
+  (`device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')`)
+  and `.to(device)` every tensor / model that flows through training.
+  Mixing CPU and GPU tensors mid-loop is a runtime crash, not a warning.
+- Reproducibility: seed everything that matters at the start of train.py:
+  `torch.manual_seed`, `np.random.seed`, `random.seed`,
+  `torch.cuda.manual_seed_all`, `torch.backends.cudnn.deterministic = True`
+  (only when reproducibility > speed).
+- Model state: `model.train()` before training, `model.eval()` before
+  validation/inference. Forgetting this leaves dropout/batchnorm in the
+  wrong mode — silent accuracy drop.
+- Gradient discipline: `optimizer.zero_grad()` BEFORE every forward pass,
+  not after. `loss.backward()` then `optimizer.step()`. If you skip
+  zero_grad, gradients accumulate from prior batches.
+- No-grad context for inference: `with torch.no_grad(): ...` or
+  `@torch.inference_mode()` decorator. Saves memory and makes intent clear.
+- DataLoader: `num_workers > 0` for real datasets (pickling caveat on
+  Windows / spawn-mode). `pin_memory=True` when transferring to GPU.
+- Mixed precision: `torch.cuda.amp.autocast()` + `GradScaler` when training
+  large models on CUDA — 1.5-2x throughput, half the memory.
+- Save BOTH model state_dict AND optimizer state_dict for checkpoints
+  (resuming training requires both). Save `config` / `epoch` too.
+- Type-annotate tensor shapes in comments or use jaxtyping/torchtyping
+  for non-trivial functions. `(B, C, H, W)` is convention; document deviations."""
+
+PYTORCH_PROJECT_STRUCTURE = """\
+## Project Structure (PyTorch training/inference project)
+
+```
+requirements.txt                # torch, torchvision, etc. — pin major versions
+train.py                        # entry point: argparse, seed, train loop
+eval.py                         # entry point: load checkpoint, run on test set
+infer.py                        # entry point: load checkpoint, single-input demo
+src/
+    model.py                    # nn.Module subclass(es)
+    data.py                     # Dataset + DataLoader factories
+    losses.py                   # custom losses (if any)
+    optim.py                    # optimizer + scheduler factory
+    utils.py                    # seeding, logging, checkpoint I/O
+configs/
+    base.yaml                   # OmegaConf / hydra defaults
+    experiment_a.yaml
+checkpoints/                    # gitignored — produced at runtime
+    best.pt
+    last.pt
+runs/                           # tensorboard logs, gitignored
+tests/
+    test_model.py               # forward-pass shape, gradient-flow tests
+    test_data.py                # dataset __len__, __getitem__ shape/dtype
+    test_overfit.py             # the canonical "1-batch overfit" test
+```
+
+**Critical setup**:
+- requirements.txt should pin torch with the right CUDA/CPU variant
+  (`torch==2.x.y --index-url https://download.pytorch.org/whl/cu121` or similar
+  in install instructions, not requirements.txt — pip can't follow that).
+- config-driven: never hardcode lr/batch/epochs in train.py. Read from
+  YAML / argparse so experiments are reproducible from disk."""
+
+PYTORCH_ANTI_PATTERNS = """\
+## NEVER Do These (PyTorch mistakes)
+- NEVER `.cuda()` without `if torch.cuda.is_available()` — your training
+  script will crash on a CPU-only laptop where you're trying to debug it.
+- NEVER mix CPU and GPU tensors. Symptoms: `Expected all tensors to be on
+  the same device`. Fix: `.to(device)` every input + every model.
+- NEVER call `loss.backward()` twice on the same graph without
+  `retain_graph=True` — the autograd graph is consumed on first backward.
+  And don't pass `retain_graph=True` reflexively; it pins memory.
+- NEVER mutate parameters in-place during training (`.data = ...`)
+  unless you really know why. Use `optimizer.step()`.
+- NEVER forget `model.eval()` before validation — dropout/batchnorm misbehave.
+- NEVER run gradient updates inside `torch.no_grad()` — gradients are
+  silently zero, training appears to run but loss never moves.
+- NEVER preload an entire dataset into memory in `__init__`. Subclass
+  `torch.utils.data.Dataset` and load lazily in `__getitem__`.
+- NEVER `print` from the inner training loop on every batch — slows
+  training to a crawl on fast iterations. Log every N steps instead.
+- NEVER plot a `tensor` with `.requires_grad=True` directly — `.detach()`
+  first, `.cpu().numpy()` after, or matplotlib fails confusingly.
+- NEVER load a checkpoint and forget to call `model.eval()` before
+  inference / `model.train()` before resuming.
+- NEVER train without a smoke "overfit a single batch" test. If the model
+  can't drive that loss to ~0, training won't ever work — and you'll
+  burn an hour of GPU time finding out."""
+
+PYTORCH_FEW_SHOT_SCAFFOLD = """\
+## Example: a minimal training loop with all the right pieces
+
+```
+write_file("src/model.py", `import torch
+import torch.nn as nn
+
+class TinyMLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, in_dim) -> (B, out_dim)
+        return self.net(x)
+`)
+
+write_file("train.py", `import argparse, random
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from src.model import TinyMLP
+
+def seed_everything(s: int) -> None:
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--test", action="store_true",
+                   help="run a 1-batch overfit smoke and exit")
+    args = p.parse_args()
+
+    seed_everything(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Synthetic linearly-separable data
+    x = torch.randn(256, 8)
+    y = (x.sum(dim=1) > 0).long()
+    loader = DataLoader(TensorDataset(x, y), batch_size=args.batch,
+                        shuffle=True, pin_memory=device.type == "cuda")
+
+    model = TinyMLP(8, 32, 2).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    for epoch in range(args.epochs):
+        model.train()
+        running = 0.0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            opt.step()
+            running += loss.item()
+        print(f"epoch {epoch} loss {running / len(loader):.4f}")
+        if args.test: break
+
+    torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                "epoch": args.epochs}, "checkpoints/last.pt")
+
+if __name__ == "__main__":
+    main()
+`)
+```"""
+
+PYTORCH_FEW_SHOT_MAIN = """\
+## Example: the canonical "overfit a single batch" smoke test
+
+```python
+# tests/test_overfit.py
+import torch
+from src.model import TinyMLP
+
+def test_overfits_single_batch():
+    \"\"\"If the model can't drive loss to ~0 on ONE batch in 200 steps,
+    nothing about training will work. This is the cheapest signal that
+    the architecture + loss + optimizer are wired correctly.\"\"\"
+    torch.manual_seed(0)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = TinyMLP(8, 32, 2).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    x = torch.randn(16, 8, device=device)
+    y = torch.randint(0, 2, (16,), device=device)
+
+    losses = []
+    model.train()
+    for _ in range(200):
+        opt.zero_grad()
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+
+    assert losses[-1] < 0.1, (
+        f"model couldn't overfit a single batch in 200 steps; "
+        f"final loss = {losses[-1]:.4f}. Architecture or training loop is broken."
+    )
+```"""
+
+PYTORCH_FEW_SHOT_DB_PATTERN = """\
+## Datasets and DataLoaders — the real shape of data IO
+
+### Custom Dataset
+```python
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+from pathlib import Path
+
+class ImageLabelDataset(Dataset):
+    def __init__(self, root: str, transform=None) -> None:
+        self.paths = sorted(Path(root).glob("**/*.jpg"))
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        path = self.paths[idx]
+        img = Image.open(path).convert("RGB")
+        label = int(path.parent.name)
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+```
+
+### DataLoader configured for GPU training
+```python
+loader = DataLoader(
+    dataset,
+    batch_size=64,
+    shuffle=True,
+    num_workers=4,        # parallel data loading (set to 0 if Windows or debugging)
+    pin_memory=True,      # faster CPU→GPU transfer
+    persistent_workers=True,  # avoid worker startup cost each epoch
+    drop_last=True,       # avoid uneven last batch in BatchNorm models
+)
+```
+
+### Stream from disk if dataset doesn't fit in RAM
+Don't preload the whole thing in __init__. PyTorch's Dataset is designed
+for lazy `__getitem__` — keep it that way."""
+
+PYTORCH_FUNCTIONAL_TEST_GUIDANCE = """\
+## PyTorch testing — the three tests that catch 80% of training bugs
+
+1. **Shape test**: a forward pass with a known input shape produces the
+   expected output shape. Catches: missing reshape, wrong layer dims.
+   ```python
+   def test_forward_shape():
+       m = MyModel()
+       y = m(torch.randn(4, 3, 224, 224))  # (B, C, H, W)
+       assert y.shape == (4, 10), f"got {y.shape}"
+   ```
+
+2. **Gradient flow test**: every parameter that should be trainable HAS
+   a gradient after one backward pass. Catches: detach() in the wrong
+   place, frozen layers that shouldn't be frozen.
+   ```python
+   def test_all_params_get_grads():
+       m = MyModel()
+       y = m(torch.randn(4, 3, 224, 224))
+       y.sum().backward()
+       for name, p in m.named_parameters():
+           if p.requires_grad:
+               assert p.grad is not None, f"no grad for {name}"
+               assert p.grad.abs().sum() > 0, f"zero grad for {name}"
+   ```
+
+3. **Overfit-single-batch test** (see PYTORCH_FEW_SHOT_MAIN). Catches:
+   wrong loss, broken optimizer, learning rate ~0, wrong device, model
+   in eval() mode during training.
+
+These are pytest tests, not training runs. They should complete in <30s
+each. If they need a GPU and CI doesn't have one, gate with
+`@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs GPU')`."""
+
+PYTORCH_FEW_SHOT_NAMING = """\
+## Naming conventions (PyTorch projects)
+- Modules / classes: PascalCase: `TinyMLP`, `ResNet18`, `ImageDataset`
+- Functions: snake_case: `train_one_epoch`, `seed_everything`, `load_checkpoint`
+- Tensor variables: convey shape in name when non-trivial:
+  `images_bchw` (batch, channels, height, width), `logits_bc` (batch, classes)
+- Loss: just `loss` per step; `running_loss` / `epoch_loss` for accumulators
+- Device: `device` (single torch.device), never separate cpu/gpu vars
+- Files: `model.py`, `data.py`, `train.py`, `eval.py`, `infer.py`,
+  `losses.py`, `utils.py` — flat, descriptive, no clever abbreviations
+- Configs: `configs/<experiment_name>.yaml` — name describes what it tests"""
+
+PYTORCH_ITERATE_PROMPT = """\
+You are iterating on a PyTorch project.
+
+Tools: edit_file, write_file, line_edit, run_command, read_file.
+
+Rules:
+- After model edits: run the shape test, the grad-flow test, and the
+  overfit-single-batch test (in that order). They're cheap and they
+  pinpoint where training is broken.
+- Keep .to(device) discipline. CPU and GPU tensors don't mix.
+- model.train() during training; model.eval() during validation/inference.
+- Do not pin retain_graph=True without a comment explaining why.
+- If a parameter mysteriously stops learning, check requires_grad,
+  check if you're inside torch.no_grad(), check the optimizer's param_groups.
+
+CURRENT ISSUES:
+{validation_failures}
+
+{code_map}"""
+
+PYTORCH_ITERATE_FEATURE_PROMPT = """\
+Implement the requested feature in the existing PyTorch project.
+- Match the layout: model code in src/model.py, data in src/data.py,
+  entry points at top level (train.py / eval.py / infer.py)
+- Update tests/ if you add a new component — at minimum a shape test
+- Use config (argparse / YAML) — never hardcode lr/batch/epochs
+- After: pytest tests/ passes, the shape + gradient-flow + overfit
+  smoke tests all pass
+
+CURRENT ISSUES:
+{validation_failures}
+
+{instruction}
+
+{code_map}"""

@@ -18,6 +18,7 @@ _KNOWN_TAGS = {
     "python", "typescript", "javascript", "react", "vue", "angular",
     "electron", "desktop", "go", "golang", "rust", "cargo", "tokio",
     "wordpress", "plugin", "php", "browser", "extension", "chrome", "mv3",
+    "pytorch", "torch", "cuda", "gpu", "training", "deep", "transformer",
     "html", "css", "node", "flask", "django", "fastapi", "express",
     "pygame", "click", "asyncio", "aiosqlite", "sqlite", "pytest",
     "vitest", "jest", "phpunit", "modular", "flat",
