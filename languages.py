@@ -252,6 +252,48 @@ _RUST_STDLIB = {
 }
 
 
+def pytorch_language() -> Language:
+    """Create Language config for PyTorch / GPU-ML projects.
+
+    Family is "python" — same toolchain as python_language(). The only
+    difference is the prompt content: device discipline (.to(device)),
+    training-loop hygiene (zero_grad/backward/step order), the
+    overfit-single-batch smoke test, mixed-precision patterns, etc. The
+    autobuilder's machine has a 4090; CUDA is available; this strategy
+    encodes the patterns that make GPU training work and the patterns
+    that silently break it.
+    """
+    return Language(
+        name="pytorch",
+        family="python",
+        extensions=[".py"],
+        entry_point="train.py",
+        init_file="__init__.py",
+        test_prefix="test_",
+        test_suffix="",
+        package_file=None,
+        install_cmd="pip3 install",
+        run_cmd="python3",
+        build_cmd="",
+        test_cmd=["python3", "-m", "pytest", "-x", "--tb=short", "-q"],
+        lint_cmd=None,
+        syntax_check_cmd=["python3", "-m", "py_compile"],
+        stdlib_modules=_PYTHON_STDLIB,
+        import_pattern=re.compile(r'^\s*(?:import\s+(\S+)|from\s+(\S+)\s+import)'),
+        fence_langs=["python"],
+        coding_standards=quality.PYTORCH_CODING_STANDARDS,
+        project_structure=quality.PYTORCH_PROJECT_STRUCTURE,
+        anti_patterns=quality.PYTORCH_ANTI_PATTERNS,
+        few_shot_scaffold=quality.PYTORCH_FEW_SHOT_SCAFFOLD,
+        few_shot_main=quality.PYTORCH_FEW_SHOT_MAIN,
+        few_shot_db_pattern=quality.PYTORCH_FEW_SHOT_DB_PATTERN,
+        functional_test_guidance=quality.PYTORCH_FUNCTIONAL_TEST_GUIDANCE,
+        few_shot_naming=quality.PYTORCH_FEW_SHOT_NAMING,
+        iterate_prompt=quality.PYTORCH_ITERATE_PROMPT,
+        iterate_feature_prompt=quality.PYTORCH_ITERATE_FEATURE_PROMPT,
+    )
+
+
 def wordpress_language() -> Language:
     """Create Language config for WordPress plugins (PHP).
 
@@ -589,6 +631,20 @@ _BROWSER_EXT_KEYWORDS = frozenset({
     "browser plugin", "extension popup",
 })
 
+# PyTorch keywords. Distinct from python_language() because the LLM gets
+# wildly different guidance on a "Flask app" vs. a "PyTorch training loop".
+# "torch" alone is too generic (could be unrelated); require an ML signal
+# alongside it (training, model, fine-tune, neural, etc.) — see detect_language.
+_PYTORCH_HARD_KEYWORDS = frozenset({
+    "pytorch", "torch.nn", "torch.cuda", "torch.optim", "fine-tune",
+    "fine tune", "training loop", "model checkpoint", "deep learning",
+    "neural network", "neural net", "transformer model", "lora",
+})
+_PYTORCH_SOFT_KEYWORDS = frozenset({
+    "torch", "cuda", "gpu", "model", "training", "inference",
+    "backprop", "gradient", "loss", "tensor",
+})
+
 _RUST_KEYWORDS = frozenset({
     "rust", "cargo", "rustc", "rust crate", "cargo.toml", "rust binary",
     "rust library", "tokio", "serde",
@@ -614,6 +670,21 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
         return wordpress_language()
     if any(re.search(rf"\b{re.escape(kw)}\b", task_lower) for kw in _BROWSER_EXT_KEYWORDS):
         return browser_extension_language()
+
+    # PyTorch / GPU ML — a Python-family overlay with richer guidance.
+    # Either an explicit hard keyword, OR "torch" / "cuda" + an ML soft
+    # keyword. This avoids routing "a torch app for a flashlight UI" to
+    # PyTorch but catches "fine-tune a transformer on cuda" cleanly.
+    if any(re.search(rf"\b{re.escape(kw)}\b", task_lower) for kw in _PYTORCH_HARD_KEYWORDS):
+        return pytorch_language()
+    if (
+        re.search(r"\btorch\b", task_lower)
+        or re.search(r"\bcuda\b", task_lower)
+    ) and any(
+        re.search(rf"\b{re.escape(kw)}\b", task_lower)
+        for kw in _PYTORCH_SOFT_KEYWORDS - {"torch", "cuda"}
+    ):
+        return pytorch_language()
 
     # Compiled-language detection — check BEFORE Python/JS so a task that
     # mentions "rust web service" or "go cli with serde" routes correctly.
