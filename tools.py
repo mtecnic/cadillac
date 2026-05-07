@@ -248,9 +248,16 @@ ALLOWED_COMMANDS = {
     "node", "npm", "npx", "bun",
     "tsc", "tsx", "eslint", "jest", "vitest", "prettier",
     "yarn", "pnpm", "vite", "ng",
+    # Compiled-language toolchains added during Phase 2 — without these,
+    # the LLM has to wrap every invocation in `cd && go test` which is
+    # awkward and breaks plain `go version` style probes.
+    "go", "gofmt", "goimports",
+    "cargo", "rustc", "rustfmt",
+    # PHP / WordPress family
+    "php", "phpunit", "composer",
     "ls", "cat", "head", "tail", "wc", "find", "grep", "sort", "uniq",
     "mkdir", "rm", "cp", "mv", "touch", "chmod", "diff",
-    "echo", "env", "which", "file", "stat",
+    "echo", "env", "which", "file", "stat", "curl",
     "cd", "timeout", "pwd", "lsof", "ss", "netstat",
     "true", "false", "test",
 }
