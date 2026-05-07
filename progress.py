@@ -135,9 +135,14 @@ class Progress:
         return " | ".join(parts)
 
     def write(self):
-        """Write progress.md to workspace."""
+        """Write progress.md to workspace, atomically.
+
+        Atomic rename — a crash mid-write would have left progress.md
+        truncated. The file is read by humans during long builds, so a
+        torn write is a real UX issue. (Audit M1.)
+        """
         if not self.workspace:
             return
+        from ._atomic import atomic_write_text
         path = os.path.join(self.workspace, "progress.md")
-        with open(path, "w") as f:
-            f.write(self.to_markdown())
+        atomic_write_text(path, self.to_markdown())
