@@ -578,6 +578,81 @@ def _check_lint_ts(workspace: str) -> list[CheckResult]:
     return [CheckResult("lint", False, output, "warning")]
 
 
+def _verify_build_artifacts(node_dir: str, lang) -> "CheckResult | None":
+    """After a `vite build` (or similar) succeeds, verify the produced
+    artifacts are actually present. Returns a FAIL CheckResult if missing,
+    None if everything looks right.
+
+    Catches the failure mode where the build pipeline returns 0 but the
+    output dir is empty or missing critical files — wrong vite config,
+    missing entry, build wrote to a different dir than the one referenced
+    by the manifest/preview/launcher.
+    """
+    if lang.name == "electron":
+        # vite-plugin-electron writes to dist-electron/ (main + preload) and
+        # dist/ (renderer). package.json's "main" should be dist-electron/main.js.
+        main_js = os.path.join(node_dir, "dist-electron", "main.js")
+        if not os.path.isfile(main_js):
+            return CheckResult(
+                "run", False,
+                "electron build returned 0 but dist-electron/main.js is missing — "
+                "vite-plugin-electron likely not configured (check vite.config.ts "
+                "imports `electron` from 'vite-plugin-electron' with both main "
+                "and preload entries)",
+                severity="error",
+            )
+        renderer_html = os.path.join(node_dir, "dist", "index.html")
+        if not os.path.isfile(renderer_html):
+            return CheckResult(
+                "run", False,
+                "electron build returned 0 but dist/index.html (renderer) is missing — "
+                "vite needs index.html at workspace root referencing /src/renderer/main.tsx",
+                severity="error",
+            )
+    elif lang.name == "browser_extension":
+        # The extension bundle should contain manifest.json + at least one
+        # script. @crxjs/vite-plugin and vite-plugin-web-extension both
+        # output to dist/ by default.
+        dist_manifest = os.path.join(node_dir, "dist", "manifest.json")
+        if not os.path.isfile(dist_manifest):
+            return CheckResult(
+                "run", False,
+                "browser-extension build returned 0 but dist/manifest.json is missing — "
+                "vite-plugin-web-extension or @crxjs/vite-plugin not configured "
+                "(check vite.config.ts)",
+                severity="error",
+            )
+        # Quick sanity: manifest_version should be 3.
+        try:
+            with open(dist_manifest) as f:
+                manifest = json.load(f)
+            if manifest.get("manifest_version") != 3:
+                return CheckResult(
+                    "run", False,
+                    f"dist/manifest.json has manifest_version="
+                    f"{manifest.get('manifest_version')!r}, expected 3 — Chrome "
+                    "rejects new MV2 uploads",
+                    severity="error",
+                )
+        except Exception as e:
+            return CheckResult(
+                "run", False,
+                f"dist/manifest.json present but unreadable: {e}",
+                severity="error",
+            )
+    elif lang.name in ("react", "vue", "angular"):
+        # Standard SPA build → dist/index.html
+        dist_html = os.path.join(node_dir, "dist", "index.html")
+        if not os.path.isfile(dist_html):
+            return CheckResult(
+                "run", False,
+                f"{lang.name} build returned 0 but dist/index.html is missing — "
+                "build pipeline didn't emit anything useful",
+                severity="error",
+            )
+    return None
+
+
 def check_entry_point(workspace: str, entry_point: str = "main.py", lang=None) -> list[CheckResult]:
     """Run the entry point with --test flag."""
     entry = os.path.join(workspace, entry_point)
@@ -603,10 +678,16 @@ def check_entry_point(workspace: str, entry_point: str = "main.py", lang=None) -
             node_dir = _find_node_project_dir(workspace)
             cmd = _npx_no_install(lang.build_cmd.split())
             r = _run(cmd, cwd=node_dir, timeout=120)
-            if r.returncode == 0:
-                return [CheckResult("run", True, f"{lang.name} build succeeded")]
-            output = (r.stdout + "\n" + r.stderr).strip()[-1500:]
-            return [CheckResult("run", False, f"Build failed: {output}")]
+            if r.returncode != 0:
+                output = (r.stdout + "\n" + r.stderr).strip()[-1500:]
+                return [CheckResult("run", False, f"Build failed: {output}")]
+            # Build succeeded — verify the build produced the artifacts we
+            # actually need. The LLM sometimes ships a "successful" build
+            # whose output dir is empty (wrong vite config, missing entry).
+            artifact_check = _verify_build_artifacts(node_dir, lang)
+            if artifact_check:
+                return [artifact_check]
+            return [CheckResult("run", True, f"{lang.name} build succeeded with expected artifacts")]
         return [CheckResult("run", True, f"Entry point {entry_point} exists")]
 
     if lang and lang.family == "node":
@@ -2458,6 +2539,7 @@ def check_wiring(workspace: str, lang=None) -> list[CheckResult]:
 _SEC_SKIP_DIRS = (
     "node_modules", "__pycache__", "dist", "build", "venv", ".venv",
     ".git", ".cadillac", ".pytest_cache",
+    "vendor",  # composer-installed PHP deps — never our code
 )
 
 
@@ -2472,8 +2554,8 @@ class _SecFinding:
 
 
 def _sec_relevant_file(path: str, lang) -> str | None:
-    """Return 'py' | 'ts' | 'js' | None depending on whether we should scan
-    this file. Skips dependency dirs and dotfiles."""
+    """Return 'py' | 'ts' | 'js' | 'php' | None depending on whether we
+    should scan this file. Skips dependency dirs and dotfiles."""
     parts = path.split(os.sep)
     if any(p in _SEC_SKIP_DIRS for p in parts):
         return None
@@ -2483,6 +2565,8 @@ def _sec_relevant_file(path: str, lang) -> str | None:
         return "ts"
     if path.endswith((".js", ".jsx")):
         return "js"
+    if path.endswith(".php"):
+        return "php"
     return None
 
 
@@ -2495,7 +2579,7 @@ _SEC_PATTERNS: list[dict] = [
     {
         "rule": "hardcoded_secret",
         "severity": "high",
-        "kinds": {"py", "ts", "js"},
+        "kinds": {"py", "ts", "js", "php"},
         # Assignment to a secret-named identifier with a string literal that
         # is NOT obviously a placeholder/empty/env lookup. ≥6 chars is a
         # heuristic to skip "" and "x" placeholders.
@@ -2511,14 +2595,14 @@ _SEC_PATTERNS: list[dict] = [
     {
         "rule": "aws_access_key",
         "severity": "high",
-        "kinds": {"py", "ts", "js"},
+        "kinds": {"py", "ts", "js", "php"},
         "regex": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
         "why": "AWS access key literal in source.",
     },
     {
         "rule": "private_key_block",
         "severity": "high",
-        "kinds": {"py", "ts", "js"},
+        "kinds": {"py", "ts", "js", "php"},
         "regex": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
         "why": "PEM private key embedded in source.",
     },
@@ -2598,7 +2682,7 @@ _SEC_PATTERNS: list[dict] = [
     {
         "rule": "jwt_alg_none",
         "severity": "high",
-        "kinds": {"py", "ts", "js"},
+        "kinds": {"py", "ts", "js", "php"},
         "regex": re.compile(r"""algorithm[s]?\s*[:=]\s*['"]?(none|None)['"]?"""),
         "why": ("JWT algorithm 'none' disables signature verification — anyone can "
                 "forge tokens. Use HS256 / RS256 with a real key."),
@@ -2606,12 +2690,101 @@ _SEC_PATTERNS: list[dict] = [
     {
         "rule": "jwt_verify_false",
         "severity": "high",
-        "kinds": {"py", "ts", "js"},
+        "kinds": {"py", "ts", "js", "php"},
         "regex": re.compile(
             r"""jwt\.\w+\s*\([^)]*verify\s*[:=]\s*False"""
             r"""|verify_signature\s*[:=]\s*False"""
         ),
         "why": "JWT decode with verify=False — accepts any token. Use a real key + verify=True.",
+    },
+
+    # ── PHP / WordPress-specific patterns ────────────────────────────────
+    {
+        "rule": "php_sql_concat",
+        "severity": "high",
+        "kinds": {"php"},
+        # $wpdb->query("..." . $var) or $wpdb->get_results("..." . $var)
+        # — concatenated user input. Should be $wpdb->prepare("...", $var).
+        "regex": re.compile(
+            r"""\$wpdb->(?:query|get_results|get_row|get_var|get_col)\s*\(\s*['"][^'"]*['"]\s*\.\s*\$"""
+        ),
+        "why": ("string concatenation in $wpdb call — SQL injection. "
+                "Use $wpdb->prepare(\"... %s ...\", $var) so values are bound, not interpolated."),
+    },
+    {
+        "rule": "php_sql_interp",
+        "severity": "high",
+        "kinds": {"php"},
+        # $wpdb->query("SELECT ... WHERE id = $id") — variable inside double-quoted string
+        "regex": re.compile(
+            r"""\$wpdb->(?:query|get_results|get_row|get_var|get_col)\s*\(\s*"[^"]*\$\w"""
+        ),
+        "why": ("PHP interpolated variable inside SQL string in $wpdb call — SQL injection. "
+                "Use $wpdb->prepare() with placeholders instead."),
+    },
+    {
+        "rule": "php_unescaped_echo",
+        "severity": "high",
+        "kinds": {"php"},
+        # echo $_GET[...]; / echo $_POST['x']; / print($_REQUEST...)
+        "regex": re.compile(
+            r"""(?:echo|print)\s*\(?\s*\$_(?:GET|POST|REQUEST|COOKIE|SERVER)\b"""
+        ),
+        "why": ("echo of $_GET/$_POST/$_REQUEST without escaping — reflected XSS. "
+                "Wrap in esc_html(), esc_attr(), or wp_kses_post() depending on context."),
+    },
+    {
+        "rule": "php_shell_exec_interp",
+        "severity": "high",
+        "kinds": {"php"},
+        # exec / shell_exec / system / passthru with $-interpolated string OR concat
+        "regex": re.compile(
+            r"""\b(?:exec|shell_exec|system|passthru|popen|proc_open)\s*\(\s*"[^"]*\$"""
+            r"""|\b(?:exec|shell_exec|system|passthru|popen|proc_open)\s*\([^)]*\.\s*\$"""
+        ),
+        "why": ("shell function with PHP variable interpolation — command injection. "
+                "Use escapeshellarg() per arg, or pass an argv array with proc_open."),
+    },
+    {
+        "rule": "php_eval_var",
+        "severity": "high",
+        "kinds": {"php"},
+        "regex": re.compile(r"""\beval\s*\(\s*\$"""),
+        "why": "PHP eval() with a variable — arbitrary code execution if any input reaches it.",
+    },
+    {
+        "rule": "php_unserialize_user_input",
+        "severity": "high",
+        "kinds": {"php"},
+        "regex": re.compile(
+            r"""\bunserialize\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)"""
+        ),
+        "why": ("unserialize() on user input — PHP object-injection vulnerability. "
+                "Use json_decode() for untrusted data."),
+    },
+    {
+        "rule": "php_include_var",
+        "severity": "high",
+        "kinds": {"php"},
+        "regex": re.compile(
+            r"""\b(?:include|require|include_once|require_once)\s*[\(\s]+\$_(?:GET|POST|REQUEST)"""
+        ),
+        "why": ("include/require with user input — local file inclusion (LFI). "
+                "Whitelist allowed paths and use plugin_dir_path() to anchor."),
+    },
+    {
+        "rule": "wp_user_input_unsanitized",
+        "severity": "medium",
+        "kinds": {"php"},
+        # Direct use of $_GET/$_POST in update_option / insert / save without sanitize_*
+        # Heuristic: $_GET[...] or $_POST[...] used in a line with update_option /
+        # update_post_meta / wp_insert / wp_update without a sanitize_ call.
+        "regex": re.compile(
+            r"""(?:update_option|update_post_meta|wp_insert_post|wp_update_post)"""
+            r"""\s*\([^)]*\$_(?:GET|POST|REQUEST)\b"""
+        ),
+        "why": ("WordPress write call with raw $_GET/$_POST — sanitize first. "
+                "Use sanitize_text_field, sanitize_email, sanitize_url, or wp_kses_post."),
     },
     # ── Insecure transport ───────────────────────────────────────────────
     {
@@ -2741,6 +2914,29 @@ def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
                         line=line_no,
                         snippet=snippet,
                         why=pat["why"],
+                    ))
+
+            # Per-file PHP check: WP plugin file declares classes or top-level
+            # functions but lacks the ABSPATH guard. The guard is what stops
+            # direct HTTP requests from invoking the file. Fire ONCE per file.
+            if kind == "php":
+                has_class_or_func = bool(re.search(
+                    r"^\s*(?:class\s+\w+|function\s+\w+\s*\()", text, re.MULTILINE,
+                ))
+                has_abspath_guard = "ABSPATH" in text
+                # Only flag actual plugin code — skip vendor/, files that look like
+                # composer-installed deps, and files that are PURE config (no funcs).
+                if (has_class_or_func and not has_abspath_guard
+                        and "vendor/" not in rel and "/vendor/" not in rel):
+                    findings.append(_SecFinding(
+                        rule="wp_no_abspath_guard",
+                        severity="medium",
+                        file=rel,
+                        line=1,
+                        snippet="",
+                        why=("WP plugin file declares classes/functions but lacks "
+                             "`if ( ! defined( 'ABSPATH' ) ) { exit; }` — direct "
+                             "HTTP requests can include this file and execute its code."),
                     ))
     return findings
 

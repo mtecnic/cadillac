@@ -220,5 +220,135 @@ class TestSkipping(unittest.TestCase):
             self.assertEqual(errors, [])
 
 
+class TestPhpPatterns(unittest.TestCase):
+    """PHP / WordPress-specific security patterns (Phase 2 hardening)."""
+
+    def test_wpdb_concat_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "global $wpdb;\n"
+                "$id = $_GET['id'];\n"
+                "$rows = $wpdb->get_results(\"SELECT * FROM x WHERE id=\" . $id);\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertTrue(any("php_sql_concat" in e.output for e in errors))
+
+    def test_wpdb_interpolation_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "global $wpdb;\n"
+                "$id = 1;\n"
+                "$rows = $wpdb->query(\"SELECT * FROM x WHERE id = $id\");\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertTrue(any("php_sql_interp" in e.output for e in errors))
+
+    def test_wpdb_prepare_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "global $wpdb;\n"
+                "$id = 1;\n"
+                "$rows = $wpdb->get_results( $wpdb->prepare(\n"
+                "    \"SELECT * FROM x WHERE id = %d\", $id ) );\n"
+            ))
+            errors, _ = _findings(td)
+            sql = [e for e in errors if "php_sql" in e.output]
+            self.assertEqual(sql, [])
+
+    def test_unescaped_echo_of_user_input_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "echo $_GET['name'];\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertTrue(any("php_unescaped_echo" in e.output for e in errors))
+
+    def test_escaped_echo_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "echo esc_html( $_GET['name'] ?? '' );\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertEqual([e for e in errors if "php_unescaped_echo" in e.output], [])
+
+    def test_shell_exec_with_var_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "$cmd = $_POST['cmd'];\n"
+                "shell_exec(\"ls $cmd\");\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertTrue(any("php_shell_exec_interp" in e.output for e in errors))
+
+    def test_unserialize_user_input_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "$obj = unserialize($_POST['data']);\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertTrue(any("php_unserialize_user_input" in e.output for e in errors))
+
+    def test_include_user_input_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "include $_GET['page'];\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertTrue(any("php_include_var" in e.output for e in errors))
+
+    def test_missing_abspath_guard_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            # Plugin file with class but NO ABSPATH guard
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "class MP_Settings {\n"
+                "    public static function init() { /* ... */ }\n"
+                "}\n"
+            ))
+            _, warnings = _findings(td)
+            self.assertTrue(
+                any("wp_no_abspath_guard" in w.output for w in warnings),
+                f"expected ABSPATH-guard warning, got: {[w.output for w in warnings]}",
+            )
+
+    def test_abspath_guard_present_not_flagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "class MP_Settings {\n"
+                "    public static function init() { /* ... */ }\n"
+                "}\n"
+            ))
+            _, warnings = _findings(td)
+            self.assertFalse(any("wp_no_abspath_guard" in w.output for w in warnings))
+
+    def test_vendor_dir_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            # composer-installed dep with a "leak" — must NOT fire
+            _write(td, "vendor/some-pkg/src/X.php", (
+                "<?php\n"
+                "$password = \"vendored-secret-12345\";\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertEqual(errors, [])
+
+
 if __name__ == "__main__":
     unittest.main()

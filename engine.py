@@ -3784,10 +3784,11 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                     # Adversarial test pass: a SECOND LLM turn writes tests
                     # designed to break the first LLM's implementation,
                     # specifically targeting the "LLM tests its own code"
-                    # blind spot. v1 is advisory — findings surface in the
-                    # log but don't block the pipeline. False positives are
-                    # likely (LLM may probe APIs the impl doesn't promise);
-                    # we'll promote to blocking once we have telemetry.
+                    # blind spot. **Blocking** with a 2-retry cap — false
+                    # positives are possible (LLM probes APIs the impl
+                    # doesn't promise) so we don't infinite-loop, but real
+                    # bugs do force a fix pass.
+                    adv_failures_to_inject = ""
                     if getattr(cfg, "enable_adversarial_tests", True):
                         try:
                             from .adversarial import run_adversarial_tests
@@ -3800,22 +3801,93 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                     f"adversarial tests all passed"
                                 ))
                             else:
-                                emit("log", msg=(
-                                    f"[ADVERSARIAL] {adv.n_failed}/{adv.n_tests_run} "
-                                    "adversarial tests failed (advisory — not blocking):"
-                                ))
-                                for f in adv.failures[:5]:
-                                    emit("log", msg=f"  [adv] {f[:200]}")
+                                rel_test = ""
                                 if adv.test_file_path:
-                                    rel = os.path.relpath(adv.test_file_path, workspace)
+                                    rel_test = os.path.relpath(adv.test_file_path, workspace)
+                                if state.adversarial_retries < state.max_adversarial_retries:
+                                    state.adversarial_retries += 1
                                     emit("log", msg=(
-                                        f"  Generated tests at {rel} — review and "
-                                        "either fix the implementation or delete tests "
-                                        "that probe behavior the impl doesn't promise."
+                                        f"[ADVERSARIAL] {adv.n_failed}/{adv.n_tests_run} "
+                                        f"failed — retry {state.adversarial_retries}/"
+                                        f"{state.max_adversarial_retries} (BLOCKING)"
                                     ))
+                                    for f in adv.failures[:5]:
+                                        emit("log", msg=f"  [adv] {f[:200]}")
+                                    # Build the failure block to inject into BUILD.
+                                    parts = [
+                                        f"ADVERSARIAL TEST FAILURES "
+                                        f"({adv.n_failed} of {adv.n_tests_run} adversarial probes failed):",
+                                    ]
+                                    for f in adv.failures[:8]:
+                                        parts.append(f"  - {f[:300]}")
+                                    if rel_test:
+                                        parts.append("")
+                                        parts.append(
+                                            f"The adversarial tests live at {rel_test}. "
+                                            "For each failing test, decide: (a) the test "
+                                            "found a real bug — fix the implementation, "
+                                            "OR (b) the test probes behavior the impl never "
+                                            "promised — DELETE that specific test from the "
+                                            "file. Don't fix tests by weakening assertions; "
+                                            "if you delete one, justify why with a one-line "
+                                            "code comment in the file (e.g., '# removed: "
+                                            "tested behavior the spec doesn't require')."
+                                        )
+                                    adv_failures_to_inject = "\n".join(parts)
+                                    # Force a retreat-to-build by faking a failures_text
+                                    # so the existing retry path takes over below.
+                                    failures_text = adv_failures_to_inject
+                                    last_failures_summary = adv_failures_to_inject[:1500]
+                                else:
+                                    # Cap reached — log clearly and continue. Treat
+                                    # as advisory at this point: real bug or LLM
+                                    # hallucination, two passes hasn't resolved it,
+                                    # not worth burning more LLM time.
+                                    emit("log", msg=(
+                                        f"[ADVERSARIAL] retries exhausted "
+                                        f"({state.max_adversarial_retries}); accepting as advisory"
+                                    ))
+                                    for f in adv.failures[:3]:
+                                        emit("log", msg=f"  [adv-residual] {f[:200]}")
+                                    if rel_test:
+                                        emit("log", msg=(
+                                            f"  Generated tests at {rel_test} — "
+                                            "review manually."
+                                        ))
                         except Exception as _e:
-                            # Adversarial is advisory. Never let it break a build.
-                            emit("log", msg=f"[ADVERSARIAL] crashed (advisory; ignored): {_e}")
+                            emit("log", msg=f"[ADVERSARIAL] crashed (treating as advisory): {_e}")
+                    # If adversarial caused a retry, fall through to the
+                    # existing failure-retry block by goto-equivalent: just
+                    # don't `break`. Detect via failures_text being set above.
+                    if adv_failures_to_inject:
+                        # Synthesize a failure path through the existing logic
+                        emit("log", msg=(
+                            "[Adversarial bounce] retreating to BUILD to fix "
+                            "implementation or prune over-aggressive tests"
+                        ))
+                        progress.log(f"Adversarial failed: {adv_failures_to_inject[:100]}")
+                        if state.retreat_to_build():
+                            executor.grant_rewrites(max(len(manifest.files), 5))
+                            code_map = _get_code_map(failure_text=failures_text)
+                            build_prompt = build_build_prompt(
+                                entry_point=entry_point,
+                                manifest_summary=manifest.to_detailed(),
+                                progress_context=progress.to_context(),
+                                validation_failures=failures_text,
+                                lessons_text=lessons_text,
+                                code_map=code_map,
+                                lang=lang,
+                            )
+                            messages = _build_messages(build_prompt, task)
+                            messages.append({"role": "user", "content":
+                                f"{failures_text}\n\n"
+                                "Fix the implementation OR prune over-aggressive "
+                                "adversarial tests in .cadillac/adversarial/. "
+                                "edit_file lets you modify either."
+                            })
+                            no_tool_rounds = 0
+                            continue
+                        # Couldn't retreat — fall through to break with warning
                     progress.log("Validation passed" + (
                         f" ({len(warnings_list)} warning(s))" if warnings_list else ""
                     ))

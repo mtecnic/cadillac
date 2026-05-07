@@ -45,6 +45,11 @@ class PhaseState:
     max_total_rounds: int = 1000
     validate_retries: int = 0
     max_validate_retries: int = 5
+    # Adversarial pass: blocking with a low retry cap. False positives are
+    # possible (LLM probes APIs the impl doesn't promise), so we cap at 2
+    # retries and then advise+continue rather than infinite-loop.
+    adversarial_retries: int = 0
+    max_adversarial_retries: int = 2
     fix_required: bool = False  # True after retreat_to_build until first edit lands
     fix_mode_rounds_no_edit: int = 0  # Counts BUILD rounds while fix_required with no successful edit
     # Rounds spent in each phase; captured on advance() so end-of-build reporting
