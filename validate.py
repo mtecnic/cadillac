@@ -1184,6 +1184,32 @@ def run_module_validation(workspace: str, module_path: str, module_test_file: st
     return results
 
 
+# Directories that hold runtime artifacts / data / build output, NOT source.
+# Don't flag them as "empty module — never built" — they're correctly empty
+# until the program runs. Caught during the Phase 2 limit-test for PyTorch
+# where `checkpoints/` (training outputs) was being flagged repeatedly.
+_NON_SOURCE_DIRS = frozenset({
+    # ML / training artifacts
+    "checkpoints", "runs", "logs", "models", "models_cache",
+    "outputs", "results", "exports", "downloads",
+    "wandb", "mlruns", "tensorboard",
+    # Build / dist
+    "build", "dist", "dist-electron", "out", "target",
+    # Cache / tmp
+    "tmp", "cache", ".cache", ".tmp",
+    # Tooling
+    "node_modules", "__pycache__", ".venv", "venv", "env", ".env",
+    ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "coverage", ".coverage", ".cadillac", ".idea", ".vscode",
+    # Docs / data
+    "docs", "doc", "data", "datasets", "raw",
+    "examples", "samples", "fixtures",
+    # Static / templates (already covered by content-sniff in functional check
+    # but listed explicitly for the secondary check below)
+    "static", "templates", "public", "assets",
+})
+
+
 def check_functional_smoke(workspace: str, entry_point: str = "main.py", lang=None) -> list[CheckResult]:
     """Generate and run a headless smoke test that exercises cross-module imports and basic operations.
 
@@ -1234,6 +1260,11 @@ def check_functional_smoke(workspace: str, entry_point: str = "main.py", lang=No
             if os.path.exists(init_file) and py_files:
                 packages.append(item)
             elif os.path.isdir(full) and not item.startswith("."):
+                # Skip well-known non-source dirs: build artifacts, ML
+                # checkpoints, logs, caches, etc. They're correctly empty
+                # until the program runs.
+                if item in _NON_SOURCE_DIRS:
+                    continue
                 # Skip directories that contain non-Python content (frontend assets, templates, etc.)
                 # These are valid project subdirs even without .py files.
                 non_py_content = False
@@ -1247,11 +1278,23 @@ def check_functional_smoke(workspace: str, entry_point: str = "main.py", lang=No
                         break
                 if non_py_content:
                     continue  # frontend/templates/static dirs are fine
-                # Directory exists but has no .py files — might be an empty planned module
+                # Directory exists but has no .py files — might be an empty
+                # planned module. Walk recursively though: src/ with no
+                # immediate .py files but containing src/ml/model.py is a
+                # CONTAINER package, not an empty shell.
+                has_nested_py = False
+                for r2, dirs2, files2 in os.walk(full):
+                    dirs2[:] = [d for d in dirs2 if d not in
+                                ("__pycache__", "node_modules", ".venv", "venv")]
+                    if any(f.endswith(".py") and f != "__init__.py" for f in files2):
+                        has_nested_py = True
+                        break
+                if has_nested_py:
+                    continue
                 if not py_files and not os.path.exists(init_file):
                     empty_packages.append(item)
                 elif os.path.exists(init_file) and not py_files:
-                    # Has __init__.py but no other .py files — likely empty shell
+                    # Has __init__.py but no other .py files (anywhere) — empty shell
                     empty_packages.append(item)
         elif item.endswith(".py") and item != entry_point:
             top_modules.append(item[:-3])
@@ -1392,7 +1435,7 @@ def _check_functional_smoke_ts(workspace: str, entry_point: str, lang) -> list[C
     if os.path.isdir(src_dir):
         for item in sorted(os.listdir(src_dir)):
             full = os.path.join(src_dir, item)
-            if os.path.isdir(full) and not item.startswith(".") and item != "node_modules":
+            if os.path.isdir(full) and not item.startswith(".") and item not in _NON_SOURCE_DIRS:
                 has_src = any(f.endswith(ts_exts) for f in os.listdir(full))
                 if not has_src:
                     results.append(CheckResult("functional", False,
