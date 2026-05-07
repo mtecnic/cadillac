@@ -9,6 +9,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from ._atomic import atomic_write_text, file_lock
+
 VALID_CATEGORIES = ("tried_failed", "working_pattern", "reminder")
 _CATEGORY_HEADERS = {
     "tried_failed": "## Tried & Failed",
@@ -58,19 +60,25 @@ class Scratch:
         if len(content) > _CONTENT_CAP:
             content = content[:_CONTENT_CAP].rstrip() + "..."
 
-        existing = self._read_raw()
-        recent = self._recent_entries(existing, category, _DEDUP_LOOKBACK)
-        for prev in recent:
-            # Strip "- [PHASE Rn] " prefix so it doesn't dilute the overlap
-            prev_clean = re.sub(r"^-\s*\[[^\]]*\]\s*", "", prev)
-            if _word_overlap(prev_clean, content) > _DEDUP_OVERLAP:
-                return "skipped: duplicate of recent entry"
-
         os.makedirs(os.path.dirname(self.path()), exist_ok=True)
-        sections = self._parse_sections(existing)
-        new_line = f"- [{phase} R{round_num}] {content}"
-        sections.setdefault(category, []).append(new_line)
-        self._write_sections(sections)
+        # Hold the lock across the whole read-modify-write cycle.
+        # Without this, two parallel module builds appending to the root
+        # scratch can interleave: both read the same `existing`, both
+        # compute new sections, last writer wins → one entry silently
+        # lost. This was ranked HIGH in the audit (H1).
+        with file_lock(self.path()):
+            existing = self._read_raw()
+            recent = self._recent_entries(existing, category, _DEDUP_LOOKBACK)
+            for prev in recent:
+                # Strip "- [PHASE Rn] " prefix so it doesn't dilute the overlap
+                prev_clean = re.sub(r"^-\s*\[[^\]]*\]\s*", "", prev)
+                if _word_overlap(prev_clean, content) > _DEDUP_OVERLAP:
+                    return "skipped: duplicate of recent entry"
+
+            sections = self._parse_sections(existing)
+            new_line = f"- [{phase} R{round_num}] {content}"
+            sections.setdefault(category, []).append(new_line)
+            self._write_sections(sections)
         return "ok"
 
     def read(self, max_chars: int = _DEFAULT_READ_CAP) -> str:
@@ -136,5 +144,6 @@ class Scratch:
             lines.append(_CATEGORY_HEADERS[cat])
             lines.extend(entries)
             lines.append("")  # blank line between sections
-        with open(self.path(), "w", encoding="utf-8") as f:
-            f.write("\n".join(lines).rstrip() + "\n")
+        # Atomic rename — a crash mid-write leaves the old file intact
+        # rather than truncating to empty.
+        atomic_write_text(self.path(), "\n".join(lines).rstrip() + "\n")

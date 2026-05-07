@@ -54,15 +54,26 @@ def load_lessons() -> list[Lesson]:
 
 
 def save_lesson(lesson: Lesson):
-    with open(MEMORY_PATH, "a") as f:
-        f.write(json.dumps(asdict(lesson)) + "\n")
+    """Append one lesson to memory.jsonl. Lock-protected to serialize
+    concurrent appends from parallel module builds — without the lock,
+    two threads' writes can interleave and produce malformed JSON lines
+    that load_lessons() silently skips, losing data. (Audit H2.)"""
+    from ._atomic import atomic_append_lines
+    atomic_append_lines(MEMORY_PATH, [json.dumps(asdict(lesson))])
 
 
 def save_all(lessons: list[Lesson]):
-    """Rewrite the full memory file (used after pruning or confidence updates)."""
-    with open(MEMORY_PATH, "w") as f:
-        for lesson in lessons:
-            f.write(json.dumps(asdict(lesson)) + "\n")
+    """Rewrite the full memory file (used after pruning or confidence updates).
+
+    Atomic rename — a crash between truncate and the final flush would have
+    wiped every lesson the system had ever recorded. (Audit H3.) Locked
+    against concurrent save_lesson() callers so the rewrite is serialized
+    against appends.
+    """
+    from ._atomic import atomic_write_text, file_lock
+    payload = "".join(json.dumps(asdict(lesson)) + "\n" for lesson in lessons)
+    with file_lock(MEMORY_PATH):
+        atomic_write_text(MEMORY_PATH, payload)
 
 
 def _word_overlap(a: str, b: str) -> float:
@@ -289,7 +300,10 @@ def parse_reflection(text: str, tags: list[str] | None = None) -> list[Lesson]:
 
 def record_phase_outcome(phase: str, rounds: int, n_files: int,
                          tags: list[str] | None = None) -> None:
-    """Append one phase-completion record. Best-effort — never raises."""
+    """Append one phase-completion record. Best-effort — never raises.
+
+    Locked against concurrent appends so the JSONL stays parseable. (H2.)
+    """
     try:
         entry = {
             "ts": time.time(),
@@ -298,8 +312,8 @@ def record_phase_outcome(phase: str, rounds: int, n_files: int,
             "n_files": int(n_files),
             "tags": list(tags or []),
         }
-        with open(PHASE_HISTORY_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        from ._atomic import atomic_append_lines
+        atomic_append_lines(PHASE_HISTORY_PATH, [json.dumps(entry)])
     except OSError:
         pass
 
