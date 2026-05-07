@@ -1818,10 +1818,21 @@ def _wiring_check_no_localhost_hardcode(workspace: str, fe: dict) -> list[CheckR
 
 
 def _wiring_find_free_port(default: int = 5000) -> int:
+    """Discover a free port. Bind+release leaves a TOCTOU window where the
+    port can be claimed by another process before our backend grabs it.
+
+    Mitigation: SO_REUSEADDR on the probe socket so even if the kernel's
+    TIME_WAIT entry hasn't expired by the time the backend binds, the
+    bind succeeds. Doesn't fully eliminate the race (any other process
+    on the box can still take the port between our probe and the
+    backend's bind), but it removes the most common cause: our own prior
+    bind sitting in TIME_WAIT. (Audit M9.)
+    """
     import socket
     for p in (default, default + 1, default + 2, default + 3, 0):
         s = socket.socket()
         try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", p))
             picked = s.getsockname()[1]
             return picked

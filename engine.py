@@ -3837,7 +3837,18 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                         try:
                             from .adversarial import run_adversarial_tests
                             adv = run_adversarial_tests(workspace, lang, cfg, emit)
-                            if adv.skipped_reason:
+                            if getattr(adv, "crashed", False):
+                                # Distinguish "adversarial pipeline broke"
+                                # (LLM wrote bad Python, pytest crashed,
+                                # runner timed out) from "tests cleanly
+                                # determined nothing to test". Crashed cases
+                                # were silently swallowed before; now they
+                                # surface as a warning in the live log. (M6)
+                                emit("log", msg=(
+                                    f"[ADVERSARIAL/CRASHED] {adv.skipped_reason} — "
+                                    "review .cadillac/adversarial/ output"
+                                ))
+                            elif adv.skipped_reason:
                                 emit("log", msg=f"[ADVERSARIAL] skipped — {adv.skipped_reason}")
                             elif adv.passed:
                                 emit("log", msg=(
