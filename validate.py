@@ -2715,12 +2715,25 @@ _SEC_PATTERNS: list[dict] = [
         "rule": "php_sql_interp",
         "severity": "high",
         "kinds": {"php"},
-        # $wpdb->query("SELECT ... WHERE id = $id") — variable inside double-quoted string
+        # $wpdb->query("SELECT ... WHERE id = $id") — variable inside
+        # double-quoted string in a VALUE position. Specifically: an
+        # interpolation preceded (within ~40 chars) by a value-context
+        # signal (=, <, >, LIKE, IN(, VALUES(, SET ...). This avoids the
+        # false-positive on legitimate table-name interpolation
+        # (`DROP TABLE {$table_name}` / `SELECT FROM {$table_name}`)
+        # which the SQL standard requires you to interpolate — there's
+        # no placeholder syntax for identifiers in $wpdb->prepare.
         "regex": re.compile(
-            r"""\$wpdb->(?:query|get_results|get_row|get_var|get_col)\s*\(\s*"[^"]*\$\w"""
+            r"""\$wpdb->(?:query|get_results|get_row|get_var|get_col)\s*\(\s*"[^"]{0,200}"""
+            r"""(?:[=<>]\s*|LIKE\s+['"]?\s*%?|IN\s*\(\s*['"]?|VALUES\s*\(\s*['"]?|"""
+            r"""SET\s+\w+\s*=\s*['"]?)"""
+            r"""\{?\$\w""",
+            re.IGNORECASE,
         ),
-        "why": ("PHP interpolated variable inside SQL string in $wpdb call — SQL injection. "
-                "Use $wpdb->prepare() with placeholders instead."),
+        "why": ("PHP interpolated variable in a VALUE position inside a $wpdb SQL "
+                "string — SQL injection. Use $wpdb->prepare(\"... = %s ...\", $var). "
+                "(Table-name interpolation is excluded — that's required because "
+                "prepare() can't bind identifiers.)"),
     },
     {
         "rule": "php_unescaped_echo",

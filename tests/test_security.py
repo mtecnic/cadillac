@@ -247,6 +247,26 @@ class TestPhpPatterns(unittest.TestCase):
             errors, _ = _findings(td)
             self.assertTrue(any("php_sql_interp" in e.output for e in errors))
 
+    def test_wpdb_table_name_interpolation_not_flagged(self):
+        """Table-name interpolation is the canonical safe pattern — $wpdb->prepare
+        can't bind identifiers, so you HAVE to interpolate the table name. Don't
+        false-positive on this (regression: caught in Phase 2 limit-tests where
+        a real WP plugin's `DROP TABLE {$table_name}` was wrongly flagged HIGH)."""
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "plugin.php", (
+                "<?php\n"
+                "if ( ! defined( 'ABSPATH' ) ) { exit; }\n"
+                "global $wpdb;\n"
+                "$table_name = $wpdb->prefix . 'mp_things';\n"
+                "$wpdb->query(\"DROP TABLE IF EXISTS {$table_name}\");\n"
+                "$count = $wpdb->get_var(\"SELECT COUNT(*) FROM {$table_name}\");\n"
+            ))
+            errors, _ = _findings(td)
+            self.assertEqual(
+                [e for e in errors if "php_sql_interp" in e.output], [],
+                "table-name interpolation should NOT be flagged as SQL injection",
+            )
+
     def test_wpdb_prepare_not_flagged(self):
         with tempfile.TemporaryDirectory() as td:
             _write(td, "plugin.php", (
