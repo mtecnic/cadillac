@@ -2643,6 +2643,7 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
     modular_plan: ModularPlan | None = None
     modular_manifest_failures = 0
     modular_validation_errors: list[str] = []
+    flat_manifest_failures = 0  # Counts flat-plan rejections; H6 hard-stops at 3
     replan_count = 0
     replan_hint = ""
     architecture_text = ""
@@ -2895,6 +2896,12 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             progress.set_plan(plan)
                             progress.log(f"Planned {n_files} files, {n_deps} deps")
 
+                            # Clear any stale modular_plan from a prior PLAN
+                            # round that produced a modular manifest then got
+                            # rejected. Otherwise SCAFFOLD/BUILD route to
+                            # modules that don't exist in the new flat plan. (H5)
+                            modular_plan = None
+
                             # Dynamic budgets based on task complexity + past builds
                             budgets = compute_budgets(plan, task_text=task)
                             state.max_rounds.update(budgets)
@@ -2903,11 +2910,34 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
 
                             state.advance()  # -> DEPS
                         else:
-                            emit("log", msg="[Invalid manifest, retrying...]")
+                            flat_manifest_failures += 1
+                            emit("log", msg=f"[Invalid manifest, retrying ({flat_manifest_failures}/3)]")
                             progress.log("Manifest parse failed, retrying")
+                            # H6: if both modular AND flat have failed multiple
+                            # times, stop looping and surface the failure
+                            # cleanly instead of burning the global round budget.
+                            if (flat_manifest_failures >= 3
+                                    and modular_manifest_failures >= 2):
+                                emit("error", msg=(
+                                    "[PLAN] both modular and flat manifest "
+                                    "generation have failed repeatedly; "
+                                    "aborting build."
+                                ))
+                                progress.phase = "STOPPED"
+                                break
                     else:
-                        emit("log", msg="[Invalid manifest, retrying...]")
+                        flat_manifest_failures += 1
+                        emit("log", msg=f"[Invalid manifest, retrying ({flat_manifest_failures}/3)]")
                         progress.log("Manifest parse failed, retrying")
+                        if (flat_manifest_failures >= 3
+                                and modular_manifest_failures >= 2):
+                            emit("error", msg=(
+                                "[PLAN] both modular and flat manifest "
+                                "generation have failed repeatedly; "
+                                "aborting build."
+                            ))
+                            progress.phase = "STOPPED"
+                            break
 
             # ── DEPS phase ──
             elif state.current == Phase.DEPS:
