@@ -35,14 +35,25 @@ _MAX_TESTS_PER_PASS = 8
 
 @dataclass
 class AdversarialResult:
-    """Result of one adversarial pass."""
-    passed: bool                              # True if no test failures
+    """Result of one adversarial pass.
+
+    Three states distinguished:
+      - passed=True, crashed=False, skipped_reason="" — all tests ran and passed
+      - passed=False, crashed=False — tests ran, some failed (real findings)
+      - passed=True, crashed=True — adversarial pipeline itself broke (LLM
+        output was bad Python, test file failed to load, runner timed out).
+        Was previously lumped with skipped_reason and treated as advisory
+        info; now surfaced explicitly so the human sees "adversarial broke,
+        review the generated file" instead of "adversarial passed silently".
+    """
+    passed: bool                              # True if no test failures (or no test ran)
     n_tests_run: int = 0
     n_failed: int = 0
     failures: list[str] = field(default_factory=list)  # one-liner per failure
     output: str = ""                          # tail of test runner output
     skipped_reason: str = ""                  # set when nothing was probed
     test_file_path: str = ""                  # for human inspection later
+    crashed: bool = False                     # adversarial pipeline itself broke
 
 
 @dataclass
@@ -146,14 +157,16 @@ def _extract_objectives(workspace: str) -> ProjectObjectives:
 def run_adversarial_tests(workspace: str, lang, cfg, emit) -> AdversarialResult:
     """Generate adversarial tests via LLM, run them, report findings.
 
-    Returns AdversarialResult. Never raises — adversarial is advisory and
-    a crash here must NOT take down the surrounding pipeline.
+    Returns AdversarialResult. Never raises — but a crash inside the
+    pipeline now sets crashed=True so the engine can log it visibly
+    rather than passing silently as "advisory info". (Audit M6.)
     """
     try:
         return _run_adversarial_tests_inner(workspace, lang, cfg, emit)
     except Exception as e:
         return AdversarialResult(
             passed=True,
+            crashed=True,
             skipped_reason=f"adversarial pass crashed: {type(e).__name__}: {e}",
         )
 
@@ -220,13 +233,17 @@ def _run_adversarial_tests_inner(workspace: str, lang, cfg, emit) -> Adversarial
     n_run, n_fail, failures, tail = _run_test_file(workspace, lang, test_path)
 
     if n_run == 0:
-        # Test file didn't even import / run. Treat as skipped — usually an
-        # LLM authoring bug, not a real implementation finding.
+        # Test file didn't even import / run. The LLM wrote bad Python
+        # (or vitest/pytest crashed). Mark crashed=True so the engine
+        # logs this visibly — passing silently as "skipped advisory" was
+        # how a broken adversarial pass could ship without anyone
+        # noticing. (Audit M6.)
         return AdversarialResult(
             passed=True,
+            crashed=True,
             n_tests_run=0,
-            skipped_reason="adversarial test file failed to load (likely a "
-                           "test-authoring issue, not an impl bug)",
+            skipped_reason="adversarial test file failed to load (LLM "
+                           "produced unrunnable test code)",
             output=tail,
             test_file_path=test_path,
         )
@@ -543,19 +560,19 @@ def _run_test_file(workspace: str, lang, test_path: str) -> tuple[int, int, list
 
 
 def _run_pytest(workspace: str, test_path: str) -> tuple[int, int, list[str], str]:
+    """Run adversarial pytest tests via validate.py's _run() so we get
+    history-informed adaptive timeouts. Hardcoded 60s previously meant
+    larger projects' adversarial tests timed out repeatedly without
+    ever scaling up. (Audit M7.)"""
+    from .validate import _run
     rel = os.path.relpath(test_path, workspace)
-    try:
-        r = subprocess.run(
-            ["python3", "-m", "pytest", rel, "-x", "--tb=short", "-q",
-             "--no-header"],
-            cwd=workspace, capture_output=True, text=True, timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return (0, 0, [], "pytest timed out after 60s")
-    except Exception as e:
-        return (0, 0, [], f"pytest spawn failed: {e}")
-
+    r = _run(
+        ["python3", "-m", "pytest", rel, "-x", "--tb=short", "-q", "--no-header"],
+        cwd=workspace, timeout=60,
+    )
     output = (r.stdout or "") + (r.stderr or "")
+    if "Timed out" in output and not r.stdout:
+        return (0, 0, [], output[-2000:])
     n_passed, n_failed = _parse_pytest_summary(output)
     failures = _extract_pytest_failures(output)
     return (n_passed + n_failed, n_failed, failures, output[-2000:])
@@ -589,18 +606,16 @@ def _extract_pytest_failures(output: str) -> list[str]:
 
 
 def _run_vitest(workspace: str, test_path: str) -> tuple[int, int, list[str], str]:
+    """Run adversarial vitest via validate._run() for adaptive timeouts. (M7)"""
+    from .validate import _run
     rel = os.path.relpath(test_path, workspace)
-    try:
-        r = subprocess.run(
-            ["npx", "vitest", "run", "--reporter=verbose", rel],
-            cwd=workspace, capture_output=True, text=True, timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        return (0, 0, [], "vitest timed out after 120s")
-    except Exception as e:
-        return (0, 0, [], f"vitest spawn failed: {e}")
-
+    r = _run(
+        ["npx", "vitest", "run", "--reporter=verbose", rel],
+        cwd=workspace, timeout=120,
+    )
     output = (r.stdout or "") + (r.stderr or "")
+    if "Timed out" in output and not r.stdout:
+        return (0, 0, [], output[-2000:])
     n_passed, n_failed = _parse_vitest_summary(output)
     failures = _extract_vitest_failures(output)
     return (n_passed + n_failed, n_failed, failures, output[-2000:])
