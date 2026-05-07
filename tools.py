@@ -1059,7 +1059,32 @@ class ToolExecutor:
         import json as _json
         pkg_path = os.path.join(self.workspace, "package.json")
         if not os.path.exists(pkg_path):
-            return {"error": "package.json not found — not a Node project or scaffold incomplete"}
+            # Multi-language projects (e.g., Python ML + TS frontend) hit this
+            # when the primary language is python and the engine never ran the
+            # node-family scaffolding for them. Bootstrap a minimal package.json
+            # so the LLM can build out the JS side without being blocked.
+            # The fields here mirror what `_setup_typescript_project` would
+            # have written for a vanilla Node project; scripts stays empty so
+            # the LLM is free to add whichever test runner / build tool it
+            # picks.
+            try:
+                pkg = {
+                    "name": "project",
+                    "version": "1.0.0",
+                    "private": True,
+                    "dependencies": {},
+                    "devDependencies": {},
+                    "scripts": {},
+                }
+                self._config_bypass = True
+                try:
+                    with open(pkg_path, "w") as f:
+                        _json.dump(pkg, f, indent=2)
+                        f.write("\n")
+                finally:
+                    self._config_bypass = False
+            except OSError as e:
+                return {"error": f"could not bootstrap package.json: {e}"}
         try:
             with open(pkg_path) as f:
                 pkg = _json.load(f)
