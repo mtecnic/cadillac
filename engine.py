@@ -3719,9 +3719,23 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                     no_tool_rounds = 0
                     continue
                 else:
-                    emit("log", msg="[WIRING] retries exhausted, advancing to VALIDATE")
-                    state.current = Phase.VALIDATE
-                    state.round_in_phase = 0
+                    # Retries exhausted. Surface the actual error list (it
+                    # was previously hidden — humans saw "advancing" with no
+                    # context). Use state.advance() so phase_rounds_used
+                    # records the time spent in WIRING; direct mutation of
+                    # state.current bypassed that bookkeeping and corrupted
+                    # the phase-budget memory used by future builds. (H4, M4)
+                    emit("log", msg=(
+                        f"[WIRING] retries exhausted "
+                        f"({state.max_validate_retries}); "
+                        f"{len(wiring_results)} check result(s) remain:"
+                    ))
+                    for r in wiring_results:
+                        if not r.passed and r.severity == "error":
+                            first = (r.output or "").split("\n", 1)[0]
+                            emit("log", msg=f"  [wiring/error-residual] {first[:200]}")
+                    emit("log", msg="[WIRING] advancing to VALIDATE with errors above")
+                    state.advance()  # → VALIDATE; records WIRING rounds_used
                     messages = []
                     continue
 
@@ -3887,7 +3901,21 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             })
                             no_tool_rounds = 0
                             continue
-                        # Couldn't retreat — fall through to break with warning
+                        # retreat_to_build() returned False — validate_retries
+                        # was already at max. Adversarial failures are real but
+                        # we can't burn another round on them. Surface clearly
+                        # and continue to the success path with a visible warning
+                        # rather than letting it look like adversarial passed.
+                        # (H7)
+                        emit("log", msg=(
+                            "[ADVERSARIAL] retreat to BUILD blocked — validate "
+                            f"retries already at max ({state.max_validate_retries}). "
+                            "Adversarial findings remain unaddressed:"
+                        ))
+                        for line in adv_failures_to_inject.split("\n")[:8]:
+                            if line.strip():
+                                emit("log", msg=f"  [adv-residual] {line[:200]}")
+                        # Fall through to the success-path break below.
                     progress.log("Validation passed" + (
                         f" ({len(warnings_list)} warning(s))" if warnings_list else ""
                     ))
