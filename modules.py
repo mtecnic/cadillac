@@ -68,9 +68,20 @@ class ModularPlan:
             return ""
 
         lines = []
+        missing_deps: list[str] = []
         for dep_name in mod.depends_on:
             dep = self.get_module(dep_name)
             if not dep:
+                # Phantom dependency — declared in depends_on but no such
+                # module exists in the plan. Previously skipped silently;
+                # the LLM then wrote code assuming an interface that's
+                # never going to exist, which passed unit tests and broke
+                # at INTEGRATE. Surface it loudly. (Audit H8.)
+                missing_deps.append(dep_name)
+                lines.append(f"# !! WARNING: dependency '{dep_name}' is "
+                             f"declared in {module_name}.depends_on but no "
+                             f"such module exists in the plan. Either fix "
+                             f"the typo or remove the dependency.")
                 continue
             lines.append(f"# --- Dependency: {dep_name} (from {dep.path}) ---")
             if dep.real_interfaces:
@@ -86,6 +97,10 @@ class ModularPlan:
                 for iface in dep.interfaces:
                     lines.append(f"# {iface}")
             lines.append("")
+        if missing_deps:
+            # Also stash on the module so the engine can detect this and
+            # halt the module build cleanly rather than letting it ship.
+            mod.missing_deps = missing_deps  # type: ignore[attr-defined]
         return "\n".join(lines)
 
     def to_flat_plan(self) -> dict:
