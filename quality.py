@@ -2301,7 +2301,7 @@ Cargo.lock
 src/
     main.rs                  # binary entry — clap parsing + call into lib
     lib.rs                   # public API (if also publishing as lib)
-    <module>/mod.rs          # OR <module>.rs — pick one style and stick to it
+    <module>.rs              # OR <module>/mod.rs — pick one and stick to it
     <module>/<sub>.rs
 tests/
     integration_test.rs      # tests against the public lib API
@@ -2314,6 +2314,19 @@ src/lib.rs                   # `pub use` the things you mean to export
 src/internal.rs              # private modules (no `pub`)
 tests/
 ```
+
+**WHERE TESTS GO** (this is the most common LLM mistake — get it right):
+- **Unit tests** for module `foo` live INSIDE `src/foo.rs` (or `src/foo/mod.rs`)
+  in a `#[cfg(test)] mod tests { use super::*; ... }` block at the bottom of
+  the file. They test the module's private + public API.
+- **Integration tests** live in `tests/<name>.rs` at the workspace root.
+  They test the crate's public API only (no access to internals).
+- **DO NOT create a nested cargo crate per module** — `src/foo/src/lib.rs`
+  is wrong. Cargo will not run tests in those nested crates from `cargo test`
+  at the workspace root, and you'll get "running 0 tests" with no clue why.
+- **DO NOT put unit tests in a separate `tests.rs` next to the module file**
+  unless you explicitly include it via `#[cfg(test)] mod tests;` — they
+  won't run otherwise.
 
 **Cargo.toml minimum**:
 ```toml
@@ -2340,7 +2353,15 @@ RUST_ANTI_PATTERNS = """\
 - NEVER `Box<dyn Trait>` reflexively — prefer concrete types or generics with bounds
 - NEVER `String::from_utf8_unchecked` on input you didn't validate
 - NEVER ignore `#[must_use]` warnings (they exist because the value matters)
-- NEVER write `.unwrap_or_default()` without thinking — sometimes silently swallowing an error is wrong"""
+- NEVER write `.unwrap_or_default()` without thinking — sometimes silently swallowing an error is wrong
+- NEVER create a nested `src/<module>/src/lib.rs` per module — that's a
+  workspace-style sub-crate that `cargo test` will not pick up from the
+  root. Modules live in `src/<module>.rs` (or `src/<module>/mod.rs`)
+  with `#[cfg(test)] mod tests` blocks inside the module file itself.
+- NEVER put a module's unit tests in a separate file like
+  `src/foo/tests.rs` unless the module file has a matching
+  `#[cfg(test)] mod tests;` declaration to pull it in. Without that
+  declaration the tests are invisible to `cargo test`."""
 
 RUST_FEW_SHOT_SCAFFOLD = """\
 ## Example: writing a Rust module with tests
@@ -2810,8 +2831,11 @@ BROWSER_EXT_CODING_STANDARDS = """\
   background page: `"background": { "service_worker": "background.js" }`.
 - TypeScript strict mode with @types/chrome (or @types/webextension-polyfill
   for cross-browser).
-- Build via vite-plugin-web-extension or @crxjs/vite-plugin so we get
-  HMR for popup/options + manifest manipulation.
+- Build via **`@crxjs/vite-plugin@^2`** (preferred — actively maintained,
+  cleaner Vite 5 + Node 18 support) OR `vite-plugin-web-extension@^4.4`
+  if you need cross-browser. Either works; @crxjs is less likely to hit
+  the CJS-loading bug we caught in past builds. Pin the major version
+  in package.json; don't use `*`.
 - Permissions: principle of least privilege. Don't request `<all_urls>`
   if you actually need just `https://*.example.com/*`. List permissions
   exactly: `"permissions": ["storage", "activeTab"]`.
@@ -2825,9 +2849,9 @@ BROWSER_EXT_PROJECT_STRUCTURE = """\
 ## Project Structure (Chrome MV3 + Vite + TypeScript)
 
 ```
-package.json              # devDeps: vite, @crxjs/vite-plugin (or
-                          # vite-plugin-web-extension), @types/chrome,
-                          # vitest, typescript
+package.json              # devDeps: vite ^5, @crxjs/vite-plugin ^2 (or
+                          # vite-plugin-web-extension ^4.4),
+                          # @types/chrome, vitest ^1, typescript
 vite.config.ts            # imports the extension plugin; ref to manifest
 manifest.json             # MV3 manifest — entry point Chrome loads
 public/icons/             # 16/32/48/128 PNG icons referenced by manifest
