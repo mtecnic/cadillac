@@ -158,6 +158,24 @@ def _write_node_boilerplate(workspace: str, deps: list[str], lang,
             "package": "electron-builder --win --publish=never",
             "test": "vitest run",
         }
+    elif lang.name == "browser_extension":
+        # Chrome MV3 extension via @crxjs/vite-plugin (preferred — actively
+        # maintained, clean Vite 5 + Node 18 support). Pin major versions
+        # because we caught the CJS-loading bug on
+        # vite-plugin-web-extension@4.5+ in a Phase 2 limit-test; these
+        # pins lock to known-working trees.
+        dev_deps.update({
+            "@crxjs/vite-plugin": "^2",
+            "@vitejs/plugin-react": "^4", "vite": "^5",
+            "vitest": "^1", "@testing-library/react": "*",
+            "@testing-library/jest-dom": "*", "jsdom": "*",
+            "@types/chrome": "*",
+            "@types/react": "*", "@types/react-dom": "*",
+        })
+        scripts = {
+            "dev": "vite", "build": "vite build",
+            "test": "vitest run",
+        }
     elif lang.name == "vue":
         dev_deps.update({
             "@vitejs/plugin-vue": "^4", "vite": "^5",
@@ -3019,6 +3037,24 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             emit("log", msg=f"  [FAIL] {dep}: {result.get('stderr', result.get('error', ''))[:200]}")
                             all_ok = False
                             progress.log(f"Dep install failed: {dep}")
+
+                # Multi-language sweep: any well-known frontend subdir with a
+                # package.json but no node_modules needs npm install too. This
+                # was the missing piece in past Python+TS workspaces — the
+                # frontend dir bootstrapped its package.json (via add_dep) but
+                # `npm install` never ran for it, leaving frontend tsc/vitest
+                # unable to resolve react/vite/etc.
+                for sub in ("frontend", "client", "web", "ui"):
+                    sub_pkg = os.path.join(workspace, sub, "package.json")
+                    sub_nm = os.path.join(workspace, sub, "node_modules")
+                    if os.path.isfile(sub_pkg) and not os.path.isdir(sub_nm):
+                        emit("log", msg=f"[Multi-language] Installing {sub}/ deps...")
+                        sub_result = executor.run_command(f"cd {sub} && npm install")
+                        if sub_result.get("exit_code", 1) == 0:
+                            emit("log", msg=f"  [OK] npm install in {sub}/")
+                        else:
+                            err = (sub_result.get("stderr") or sub_result.get("error") or "")[:200]
+                            emit("log", msg=f"  [WARN] {sub}/ npm install failed: {err}")
 
                 if all_ok or state.round_in_phase >= 2:
                     # Tier 1 inspection — catch host-unsafe dep versions (e.g. vitest:*)
