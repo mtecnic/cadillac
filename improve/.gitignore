@@ -1,0 +1,6 @@
+# Matrix-run workspaces are huge and per-iteration; never commit them.
+matrix-runs/
+state/
+log.jsonl
+log.md
+STOP

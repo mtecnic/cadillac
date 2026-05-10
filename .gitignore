@@ -22,3 +22,13 @@ venv/
 
 # Claude Code local state
 .claude/
+
+# Atomic-write sidecar locks (cadillac/_atomic.py)
+*.lock
+
+# Improve loop state — per-iteration data, not source
+improve/state/
+improve/matrix-runs/
+improve/log.jsonl
+improve/log.md
+improve/STOP

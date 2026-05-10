@@ -203,6 +203,20 @@ def cmd_dash(args, cfg):
     sys.exit(run_dash(root=getattr(args, "root", None)))
 
 
+def cmd_improve(args, cfg):
+    """Run the closed-loop self-improvement cycle."""
+    from cadillac.improve.cli import run_improve_cycle
+    stop = run_improve_cycle(
+        cfg,
+        cadillac_root=getattr(args, "root", None),
+        max_iterations=getattr(args, "max_iterations", 30),
+        quiet=getattr(args, "quiet", False),
+    )
+    print(f"\n[improve] STOPPED after {stop.iterations} iteration(s) "
+          f"— reason: {stop.reason}")
+    sys.exit(0 if stop.reason in ("saturated", "manual") else 1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Cadillac — autonomous agent builder",
@@ -282,6 +296,19 @@ Examples:
     p_dash.add_argument("root", nargs="?", default=None,
                         help="Directory to scan for workspace-* dirs (default: cwd)")
 
+    # improve — closed-loop self-improvement cycle
+    p_improve = subparsers.add_parser(
+        "improve",
+        help="Run the audit→probe→correlate→propose→apply self-improvement "
+             "cycle until the test matrix saturates or improvements stop coming",
+    )
+    p_improve.add_argument("--max-iterations", type=int, default=30,
+                           help="Iteration cap (default 30)")
+    p_improve.add_argument("--root", default=None,
+                           help="Path to cadillac repo root (default: parent of this file)")
+    p_improve.add_argument("--quiet", action="store_true",
+                           help="Suppress per-event log output")
+
     args = parser.parse_args()
 
     if args.context_auto:
@@ -334,6 +361,8 @@ Examples:
         cmd_enhance(args, cfg)
     elif args.command == "dash":
         cmd_dash(args, cfg)
+    elif args.command == "improve":
+        cmd_improve(args, cfg)
     elif args.command is None:
         # No subcommand — check for legacy positional task or enter shell
         # Support legacy: python3 -m cadillac "task description"
