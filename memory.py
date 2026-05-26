@@ -36,6 +36,11 @@ class Lesson:
     used: int = 0
     polarity: str = "do"  # "do" = positive lesson, "dont" = anti-pattern
     tags: list = field(default_factory=list)  # Optional: language/framework/phase tags
+    # Source task that originated this lesson — used by recall() to deweight
+    # lessons whose source has zero tag overlap with the current task. Empty
+    # string for legacy lessons recorded before this field existed; those are
+    # treated as "stack-agnostic" (no decay applied).
+    source_task: str = ""
 
 
 def load_lessons() -> list[Lesson]:
@@ -150,12 +155,77 @@ def infer_task_tags(task_description: str) -> set[str]:
     return words & _KNOWN_TAGS
 
 
+# Synonyms — keywords that map to one of the canonical _KNOWN_TAGS so the
+# tag-inference pass catches semantically-equivalent mentions ("aiosqlite"
+# is unambiguously a sqlite + asyncio + python signal).
+_TAG_SYNONYMS: dict[str, set[str]] = {
+    "aiosqlite": {"python", "sqlite", "asyncio"},
+    "sqlalchemy": {"python", "sqlite"},
+    "fastapi": {"python", "fastapi", "asyncio"},
+    "celery": {"python"},
+    "redis": set(),
+    "tsc": {"typescript"},
+    "tsx": {"typescript", "react"},
+    "jsx": {"javascript", "react"},
+    "npx": {"node"},
+    "npm": {"node"},
+    "ruff": {"python"},
+    "mypy": {"python"},
+    "black": {"python"},
+    "uvicorn": {"python", "fastapi"},
+    "websockets": {"python", "asyncio"},
+    "irc": {"python", "asyncio"},
+    "tetris": {"python", "pygame"},
+    "curses": {"python"},
+    "pygame": {"python", "pygame"},
+    "rich": {"python"},
+    "ascii": set(),
+    "wp_query": {"php", "wordpress"},
+    "manifest_v3": {"browser", "extension", "chrome", "mv3"},
+}
+
+
+def infer_tags_from_text(text: str) -> set[str]:
+    """Like `infer_task_tags` but works on arbitrary lesson trigger/fix text.
+
+    Falls back to synonyms (e.g. `aiosqlite` → `{python, sqlite, asyncio}`) so
+    a lesson that only ever mentions a library still picks up the right
+    stack tags for cross-task decay in `recall()`.
+    """
+    lowered = text.lower()
+    words = set(re.findall(r"[a-z0-9_]+", lowered))
+    out: set[str] = words & _KNOWN_TAGS
+    for syn, mapped in _TAG_SYNONYMS.items():
+        if syn in words:
+            out |= mapped
+    # File-extension hints
+    if ".py" in lowered or "pytest" in lowered:
+        out.add("python")
+    if ".ts" in lowered or ".tsx" in lowered or "tsconfig" in lowered:
+        out.add("typescript")
+    if ".rs" in lowered or "cargo" in lowered:
+        out.add("rust")
+    if ".go" in lowered:
+        out.add("go")
+    return out
+
+
 def recall(task_description: str, limit: int = 10) -> list[Lesson]:
     """Score and return the most relevant lessons for a task.
 
-    Tagged lessons are filtered first: a lesson with tags is only considered
-    if its tags overlap with the task's inferred tags. Untagged lessons remain
-    eligible for all tasks (backward compatible).
+    Three filtering layers, applied in order:
+
+      1. **Tag filter (hard)**: a lesson with tags is only considered if its
+         tags overlap the task's inferred tags. (Existing behavior.)
+      2. **Source-task decay (soft)**: an untagged lesson whose `source_task`
+         shares zero inferred-tag overlap with the current task gets a 5×
+         score penalty. Stops "irc_server" lessons (originated from one big
+         async IRC build, never tagged) from dominating recall on unrelated
+         tasks. Lessons with no source_task (legacy, pre-2026-05-26) are
+         treated neutrally.
+      3. **Content tag inference (soft)**: if the lesson's trigger+fix text
+         contains stack keywords (`aiosqlite`, `pytest`, `.rs`...) that don't
+         overlap with the current task's tags, apply a 2× penalty.
     """
     lessons = load_lessons()
     if not lessons:
@@ -178,6 +248,26 @@ def recall(task_description: str, limit: int = 10) -> list[Lesson]:
         keyword_score = len(task_words & all_words) / max(len(all_words), 1)
         recency_score = 1.0 / (1 + (time.time() - lesson.ts) / 86400)
         total = keyword_score * 2 + recency_score + lesson.confidence + (lesson.used * 0.1)
+
+        # Cross-stack penalty: lesson originated from a task whose stack
+        # doesn't intersect the current one. Only meaningful when the
+        # source_task field is populated (lessons recorded after the
+        # 2026-05-26 schema change). Uses the broader synonym-aware
+        # inference so source tasks worded as "async IRC server" still
+        # signal {python, asyncio} rather than returning empty.
+        if task_tags and lesson.source_task:
+            src_tags = infer_tags_from_text(lesson.source_task)
+            if src_tags and not (src_tags & task_tags):
+                total /= 5.0
+        # Content tag inference — soft penalty when the lesson's body
+        # text talks about a stack the current task isn't on.
+        if task_tags and not lesson.tags and not lesson.source_task:
+            content_tags = infer_tags_from_text(
+                lesson.trigger + " " + lesson.fix
+            )
+            if content_tags and not (content_tags & task_tags):
+                total /= 2.0
+
         scored.append((total, lesson))
     scored.sort(key=lambda x: -x[0])
     return [lesson for _, lesson in scored[:limit]]
@@ -252,15 +342,22 @@ def prune(min_confidence: float = 0.3, min_builds: int = 5):
         save_all(kept)
 
 
-def parse_reflection(text: str, tags: list[str] | None = None) -> list[Lesson]:
+def parse_reflection(text: str, tags: list[str] | None = None,
+                       source_task: str = "") -> list[Lesson]:
     """Parse LLM reflection output into lessons.
 
     Formats:
         TYPE | TRIGGER | FIX           — positive lesson ("do")
         ANTI | TRIGGER | WHY           — anti-pattern ("dont")
 
-    If `tags` is provided, every parsed lesson is tagged with that list (so future
-    `recall()` can filter by language/framework/phase).
+    If `tags` is provided, every parsed lesson is tagged with that list (so
+    future `recall()` can filter by language/framework/phase). If
+    `source_task` is provided, every lesson captures the originating task
+    text for cross-task decay during recall.
+
+    New lessons start at confidence 0.3 (was 0.5). Three earlier successful
+    reinforcements bring it to 0.6 before the lesson outweighs the noise
+    floor in scoring — forces reuse before prominence.
     """
     lessons = []
     tags_list = list(tags) if tags else []
@@ -276,13 +373,22 @@ def parse_reflection(text: str, tags: list[str] | None = None) -> list[Lesson]:
             valid_types = {"error_pattern", "architecture", "tool_pattern", "dependency", "performance"}
             if lesson_type not in valid_types:
                 lesson_type = "error_pattern"
+            # Backfill content-derived tags so fresh lessons never land
+            # untagged — they get either the explicit tags from the caller
+            # or whatever the lesson body's keywords imply.
+            derived_tags = list(tags_list)
+            if not derived_tags:
+                body = parts[1] + " " + parts[2]
+                derived_tags = sorted(infer_tags_from_text(body))
             lessons.append(Lesson(
                 ts=time.time(),
                 type=lesson_type,
                 trigger=parts[1],
                 fix=parts[2],
+                confidence=0.3,
                 polarity=polarity,
-                tags=list(tags_list),
+                tags=derived_tags,
+                source_task=source_task[:200],
             ))
     return lessons
 

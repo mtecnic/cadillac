@@ -140,8 +140,16 @@ def apply_proposal(proposal: Proposal, cadillac_root: str, emit) -> ApplyResult:
 
 
 def commit_applied(result: ApplyResult, cadillac_root: str,
-                   *, iteration: int) -> str | None:
-    """Commit the changes from a successful apply. Returns commit SHA or None."""
+                   *, iteration: int,
+                   score_delta: float | None = None) -> str | None:
+    """Commit the changes from a successful apply. Returns commit SHA or None.
+
+    When `score_delta` is provided and exceeds +0.05 against the prior
+    iteration's matrix score, also writes a meta-lesson to cadillac/memory.jsonl
+    tagged ['cadillac', 'self'] so future improve iterations can learn from
+    what kinds of changes moved the score. The lesson captures the weakness
+    id + target file + the patch's high-level pattern.
+    """
     if not result.success:
         return None
     msg = (
@@ -162,6 +170,43 @@ def commit_applied(result: ApplyResult, cadillac_root: str,
     )
     if commit.returncode != 0:
         return None
-    sha = _run(["git", "rev-parse", "--short", "HEAD"],
+    sha_proc = _run(["git", "rev-parse", "--short", "HEAD"],
                cwd=cadillac_root, timeout=10)
-    return sha.stdout.strip() if sha.returncode == 0 else None
+    sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else None
+
+    if sha and score_delta is not None and score_delta >= 0.05:
+        _record_meta_lesson(result, sha, iteration, score_delta)
+    return sha
+
+
+def _record_meta_lesson(result: ApplyResult, sha: str, iteration: int,
+                         score_delta: float) -> None:
+    """Append one architecture-class lesson tagged ['cadillac', 'self'].
+
+    Best-effort: any failure (memory.py import, lock contention, disk full)
+    is swallowed — losing a meta-lesson never blocks an improve commit. The
+    next iteration can re-record it if the pattern reappears.
+    """
+    try:
+        from cadillac.memory import Lesson, save_lesson
+        import time
+        trigger = (
+            f"weakness {result.proposal.weakness_id} in "
+            f"{result.proposal.target_file}"
+        )
+        fix = (
+            f"matrix score improved by {score_delta:+.3f} on iter {iteration} "
+            f"(commit {sha}): {result.reason[:200]}"
+        )
+        save_lesson(Lesson(
+            ts=time.time(),
+            type="architecture",
+            trigger=trigger,
+            fix=fix,
+            confidence=0.6,    # rewarded by observed improvement
+            polarity="do",
+            tags=["cadillac", "self"],
+            source_task="cadillac improve cycle",
+        ))
+    except Exception:
+        pass
