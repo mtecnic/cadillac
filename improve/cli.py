@@ -140,8 +140,17 @@ def run_improve_cycle(cfg, *, cadillac_root: str | None = None,
             ))
             result = apply_proposal(proposal, cadillac_root, emit)
             if result.success:
+                # Score delta vs the previous iteration's aggregate. Patches
+                # that lift the matrix score by >=0.05 get a meta-lesson
+                # captured in commit_applied — so the improve cycle accrues
+                # institutional memory about what kinds of changes work.
+                score_delta = (
+                    score.aggregate - prev_score.aggregate
+                    if prev_score is not None else None
+                )
                 applied_sha = commit_applied(result, cadillac_root,
-                                              iteration=iteration)
+                                              iteration=iteration,
+                                              score_delta=score_delta)
                 emit("log", msg=f"[improve/apply] {proposal.weakness_id}: "
                                  f"committed {applied_sha or '(no sha)'}")
                 break  # one-success-per-iteration cap
