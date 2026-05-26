@@ -238,6 +238,42 @@ Source: `cadillac/phases.py:PhaseState.{current_tier,validate_retries,...}` · `
 
 ---
 
+## 🖥️ Terminal UI
+
+Cadillac is a **terminal-only** tool. Two views, both pure-stdlib + Rich, no web service, no daemon, no port.
+
+#### Live build display
+
+Runs by default during `auto` / `new` / `iterate` / `resume` / `enhance`. File tree on the left, activity log on the right, phase bar + validation mix at the top — all updating in real time:
+
+```
+╭── Cadillac · workspace-20260526-114502 ──────────────────────────────────────╮
+│ PLAN ✓  DEPS ✓  SCAFFOLD ✓  REVIEW ✓  BUILD ⟲  INTEGRATE _  VALIDATE _      │
+│ Round 47/120 · 12 files · API ~14k in / 16k out · 12m 04s                    │
+├──────────────────────────┬───────────────────────────────────────────────────┤
+│ ▼ workspace/             │ [BUILD] Round 47/120                              │
+│   ▶ api/                 │   read_file(services/auth_service.py)             │
+│   ▼ services/            │   << 87 lines                                     │
+│     ● auth_service.py    │   edit_file(services/auth_service.py)             │
+│     ○ habit_service.py   │     anchor: "def change_password"                 │
+│   ▶ persistence/         │     replace: 4 lines                              │
+│   ▶ tests/               │     ✓ applied                                     │
+│   ○ main.py              │   run_command(python3 -m pytest -q)               │
+│   ○ requirements.txt     │     << 88 passed in 10s                           │
+│ ─────────────────        │ [Validation: nam✓ imp✓ syn✓ lin✓ sec✓ ope✓        │
+│ Memory: 10 lessons       │              fra✓ fun✓ run✓ smk✓ tst✓]            │
+│ Tags: python, flask      │                                                   │
+╰──────────────────────────┴───────────────────────────────────────────────────╯
+```
+
+The file tree marks new files (`○`), recently-edited files (`●`), and currently-being-edited files (`▶`). The activity log streams every tool call (`>> tool(args)`) and its result (`<<`). Phase transitions, validation results, CRITIC scores, RUNTIME flow outcomes, and STUCK / SURGICAL events all surface here as they happen.
+
+Pass `--plain` to disable Rich and fall back to line-by-line stdout — required when piping output to a file or running in CI / non-TTY environments.
+
+Source: `cadillac/display.py` · `cadillac/events.py`
+
+---
+
 ## 📊 The dashboard
 
 ```bash
@@ -281,7 +317,7 @@ Five views, keyboard-switched:
 | `e` | **Events** | Live tail of selected workspace's `.cadillac/build.jsonl` |
 | `?` | **Help** | Key reference |
 
-**Zero services.** No port. No daemon. Pure read-only filesystem access. When you press `q`, nothing remains.
+**Zero services.** No port. No daemon. Pure read-only filesystem access. When you press `q`, nothing remains. No web UI exists or is planned — the design intent is that the only state outside your shell session is the JSONL files on disk, and any tooling that wants to read them can do so directly.
 
 ---
 
