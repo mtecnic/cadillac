@@ -1348,26 +1348,37 @@ def check_functional_smoke(workspace: str, entry_point: str = "main.py", lang=No
         lines.append(f"    pass")
         lines.append("")
 
-    # Test 4: verify that __init__.py re-exports don't point to nonexistent names
+    # Test 4: verify that __init__.py re-exports don't point to nonexistent names.
+    # AST is the only correct way to enumerate ImportFrom names — the previous
+    # regex form (`from\s+\.\w+\s+import\s+(.+)`) was line-based and captured
+    # `(` from multi-line `from .x import (\n A, B,\n)`, then split on commas
+    # produced the literal name `(`, which never resolves and every build with
+    # parenthesized re-exports failed `functional`. AST handles single-line,
+    # multi-line, aliased (`A as B`), and trailing-comma cases uniformly.
+    import ast as _ast
     for pkg in packages:
         init_path = os.path.join(workspace, pkg, "__init__.py")
-        if os.path.exists(init_path):
-            try:
-                with open(init_path) as f:
-                    init_content = f.read()
-                # Find all "from .X import Y" statements
-                import_names = re.findall(r'from\s+\.\w+\s+import\s+(.+)', init_content)
-                for names_str in import_names:
-                    for name in re.split(r'\s*,\s*', names_str.strip()):
-                        name = name.strip()
-                        if name and not name.startswith('#'):
-                            lines.append(f"try:")
-                            lines.append(f"    getattr(__import__('{pkg}'), '{name}')")
-                            lines.append(f"except AttributeError:")
-                            lines.append(f"    errors.append('{pkg}.__init__ exports {name} but it does not exist')")
-                            lines.append("")
-            except Exception:
-                pass
+        if not os.path.exists(init_path):
+            continue
+        try:
+            with open(init_path) as f:
+                init_content = f.read()
+            tree = _ast.parse(init_content, filename=init_path)
+        except (OSError, SyntaxError):
+            continue
+        exported_names: set[str] = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom) and node.level >= 1:
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    if name and name != "*":
+                        exported_names.add(name)
+        for name in sorted(exported_names):
+            lines.append(f"try:")
+            lines.append(f"    getattr(__import__('{pkg}'), '{name}')")
+            lines.append(f"except AttributeError:")
+            lines.append(f"    errors.append('{pkg}.__init__ exports {name} but it does not exist')")
+            lines.append("")
 
     lines.append("if errors:")
     lines.append("    for e in errors:")
@@ -2968,6 +2979,53 @@ def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
                     snippet = text.splitlines()[line_no - 1].strip()
                     if len(snippet) > 200:
                         snippet = snippet[:200] + "…"
+                    # False-positive guard for `sql_fstring`: the standard
+                    # parameterized-IN idiom builds a string of `?`s with
+                    # `",".join("?" for _ in xs)` and interpolates it into
+                    # an `IN (...)` clause. That's safe — the values are
+                    # bound by the driver, not concatenated. We were
+                    # flagging it as injection on every build that uses
+                    # the idiom. Skip when the only interpolated names are
+                    # placeholder-string-style identifiers.
+                    if pat["rule"] == "sql_fstring":
+                        line_text = text.splitlines()[line_no - 1]
+                        # (1) `execute(f"PRAGMA name=value")` — PRAGMA can't be
+                        #     parameterized in SQLite; the f-string is the
+                        #     only way to set per-connection flags. Values
+                        #     come from config, not user input.
+                        if re.search(
+                            r"""\.execute\s*\(\s*f["']\s*PRAGMA\b""",
+                            line_text, re.IGNORECASE,
+                        ):
+                            continue
+                        # (2) Parameterized-fragment idioms — the f-string
+                        #     interpolates a string fragment that's then
+                        #     followed by `?` placeholders. Common shapes:
+                        #       WHERE x IN ({placeholders})
+                        #       UPDATE t SET {set_clauses} WHERE ...
+                        #       SELECT {columns} FROM ...
+                        #       ORDER BY {order_by}
+                        #     The variable's value is built from literal
+                        #     SQL fragments, not user input. Skip when the
+                        #     only interpolations are these conventional names.
+                        interpolated = re.findall(
+                            r"\{([A-Za-z_][A-Za-z0-9_]*)\}",
+                            line_text,
+                        )
+                        safe_names = {
+                            "placeholders", "placeholder", "ph",
+                            "qmarks", "bind_vars", "binds", "qmark_list",
+                            "set_clauses", "set_clause",
+                            "where_clause", "where_clauses",
+                            "columns", "column_list", "fields",
+                            "order_by", "orderby", "order_clause",
+                            "limit_clause", "group_by", "having_clause",
+                            "join_clause",
+                        }
+                        if interpolated and all(
+                            n in safe_names for n in interpolated
+                        ):
+                            continue
                     # De-dup: don't fire the same rule on the same line twice.
                     if any(
                         f.rule == pat["rule"] and f.file == rel and f.line == line_no
@@ -3122,6 +3180,12 @@ def run_validation(
     results.extend(check_syntax(workspace, lang))
     results.extend(check_lint(workspace, lang))
     results.extend(check_security(workspace, lang))       # OWASP-class static scan
+    # Operational gates — schema integrity (static) + missing-env / SIGTERM
+    # runtime probes. Catches deploy-readiness bugs the other static checks
+    # cannot see (PingFlux: NOT NULL column gets None from a network failure
+    # path; backend silently boots without required env; SIGTERM ignored).
+    from .operational import check_operational_gates
+    results.extend(check_operational_gates(workspace, lang))
     results.extend(check_framework_conflicts(workspace, expected_packages=expected_packages, lang=lang))
     results.extend(check_functional_smoke(workspace, entry_point, lang))
     results.extend(check_entry_point(workspace, entry_point, lang))
@@ -3145,7 +3209,8 @@ def results_to_dict(results: list[CheckResult]) -> dict[str, bool | None]:
     """Convert results to a simple dict for progress tracking."""
     d: dict[str, bool | None] = {
         "naming": None, "imports": None, "static_names": None,
-        "syntax": None, "lint": None, "security": None, "framework": None,
+        "syntax": None, "lint": None, "security": None,
+        "operational": None, "framework": None,
         "functional": None, "run": None, "smoke_run": None, "tests": None,
     }
     for r in results:

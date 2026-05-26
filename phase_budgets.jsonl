@@ -139,3 +139,123 @@
 {"ts": 1777423353.5896468, "phase": "build", "rounds": 70, "n_files": 14, "tags": ["react", "electron", "build", "html", "typescript", "package", "vitest", "desktop"]}
 {"ts": 1777423353.5896716, "phase": "review", "rounds": 6, "n_files": 14, "tags": ["react", "electron", "build", "html", "typescript", "package", "vitest", "desktop"]}
 {"ts": 1777423353.5896952, "phase": "integrate", "rounds": 133, "n_files": 14, "tags": ["react", "electron", "build", "html", "typescript", "package", "vitest", "desktop"]}
+{"ts": 1778118280.7376912, "phase": "plan", "rounds": 2, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118280.7377744, "phase": "deps", "rounds": 2, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118280.737819, "phase": "scaffold", "rounds": 7, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118280.7378714, "phase": "build", "rounds": 166, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118280.7379084, "phase": "review", "rounds": 6, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118280.7379413, "phase": "integrate", "rounds": 50, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118280.7379727, "phase": "wiring", "rounds": 2, "n_files": 12, "tags": ["modular", "build", "package", "go", "sqlite", "validate"]}
+{"ts": 1778118964.9129195, "phase": "plan", "rounds": 2, "n_files": 16, "tags": ["cuda", "pytest", "vitest", "torch", "build", "fastapi", "pytorch", "typescript", "python", "react", "training", "modular"]}
+{"ts": 1778118964.9129932, "phase": "deps", "rounds": 1, "n_files": 16, "tags": ["cuda", "pytest", "vitest", "torch", "build", "fastapi", "pytorch", "typescript", "python", "react", "training", "modular"]}
+{"ts": 1778118964.9130442, "phase": "scaffold", "rounds": 14, "n_files": 16, "tags": ["cuda", "pytest", "vitest", "torch", "build", "fastapi", "pytorch", "typescript", "python", "react", "training", "modular"]}
+{"ts": 1778118964.9130793, "phase": "build", "rounds": 33, "n_files": 16, "tags": ["cuda", "pytest", "vitest", "torch", "build", "fastapi", "pytorch", "typescript", "python", "react", "training", "modular"]}
+{"ts": 1778118964.9131088, "phase": "integrate", "rounds": 7, "n_files": 16, "tags": ["cuda", "pytest", "vitest", "torch", "build", "fastapi", "pytorch", "typescript", "python", "react", "training", "modular"]}
+{"ts": 1778119578.6846786, "phase": "plan", "rounds": 4, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778119578.6847396, "phase": "deps", "rounds": 1, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778119578.684781, "phase": "scaffold", "rounds": 12, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778119578.6848161, "phase": "review", "rounds": 6, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778119578.6848614, "phase": "build", "rounds": 11, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778119578.6848955, "phase": "integrate", "rounds": 6, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778119578.6849298, "phase": "validate", "rounds": 1, "n_files": 12, "tags": ["python", "javascript", "typescript", "build", "torch", "pytest", "fastapi", "node", "package", "wiring", "training", "pytorch", "modular"]}
+{"ts": 1778120783.306889, "phase": "plan", "rounds": 3, "n_files": 12, "tags": ["javascript", "wordpress", "build", "html", "plugin", "phpunit", "php"]}
+{"ts": 1778120783.306953, "phase": "deps", "rounds": 1, "n_files": 12, "tags": ["javascript", "wordpress", "build", "html", "plugin", "phpunit", "php"]}
+{"ts": 1778120783.3069856, "phase": "scaffold", "rounds": 5, "n_files": 12, "tags": ["javascript", "wordpress", "build", "html", "plugin", "phpunit", "php"]}
+{"ts": 1778120783.3070128, "phase": "build", "rounds": 75, "n_files": 12, "tags": ["javascript", "wordpress", "build", "html", "plugin", "phpunit", "php"]}
+{"ts": 1778120783.307038, "phase": "integrate", "rounds": 49, "n_files": 12, "tags": ["javascript", "wordpress", "build", "html", "plugin", "phpunit", "php"]}
+{"ts": 1778254841.9668345, "phase": "plan", "rounds": 2, "n_files": 20, "tags": ["build", "rust", "cargo"]}
+{"ts": 1778254841.9718566, "phase": "deps", "rounds": 2, "n_files": 20, "tags": ["build", "rust", "cargo"]}
+{"ts": 1778254841.9738564, "phase": "scaffold", "rounds": 12, "n_files": 20, "tags": ["build", "rust", "cargo"]}
+{"ts": 1778254841.9754598, "phase": "build", "rounds": 68, "n_files": 20, "tags": ["build", "rust", "cargo"]}
+{"ts": 1778254841.9771943, "phase": "integrate", "rounds": 37, "n_files": 20, "tags": ["build", "rust", "cargo"]}
+{"ts": 1778255722.8336577, "phase": "plan", "rounds": 4, "n_files": 16, "tags": ["browser", "extension", "build", "modular", "chrome", "package", "css", "jest", "typescript", "vitest", "html", "click", "react", "plugin", "mv3"]}
+{"ts": 1778255722.838544, "phase": "deps", "rounds": 1, "n_files": 16, "tags": ["browser", "extension", "build", "modular", "chrome", "package", "css", "jest", "typescript", "vitest", "html", "click", "react", "plugin", "mv3"]}
+{"ts": 1778255722.8404336, "phase": "scaffold", "rounds": 14, "n_files": 16, "tags": ["browser", "extension", "build", "modular", "chrome", "package", "css", "jest", "typescript", "vitest", "html", "click", "react", "plugin", "mv3"]}
+{"ts": 1778255722.842243, "phase": "review", "rounds": 6, "n_files": 16, "tags": ["browser", "extension", "build", "modular", "chrome", "package", "css", "jest", "typescript", "vitest", "html", "click", "react", "plugin", "mv3"]}
+{"ts": 1778255722.843949, "phase": "build", "rounds": 73, "n_files": 16, "tags": ["browser", "extension", "build", "modular", "chrome", "package", "css", "jest", "typescript", "vitest", "html", "click", "react", "plugin", "mv3"]}
+{"ts": 1778256291.0394197, "phase": "plan", "rounds": 4, "n_files": 20, "tags": ["pytorch", "typescript", "deps", "cuda", "html", "package", "training", "pytest", "python", "build", "vitest", "torch", "fastapi", "react", "jest", "plugin"]}
+{"ts": 1778256291.0439298, "phase": "deps", "rounds": 1, "n_files": 20, "tags": ["pytorch", "typescript", "deps", "cuda", "html", "package", "training", "pytest", "python", "build", "vitest", "torch", "fastapi", "react", "jest", "plugin"]}
+{"ts": 1778256291.0454905, "phase": "scaffold", "rounds": 20, "n_files": 20, "tags": ["pytorch", "typescript", "deps", "cuda", "html", "package", "training", "pytest", "python", "build", "vitest", "torch", "fastapi", "react", "jest", "plugin"]}
+{"ts": 1778256291.0473125, "phase": "review", "rounds": 6, "n_files": 20, "tags": ["pytorch", "typescript", "deps", "cuda", "html", "package", "training", "pytest", "python", "build", "vitest", "torch", "fastapi", "react", "jest", "plugin"]}
+{"ts": 1778256291.048815, "phase": "build", "rounds": 13, "n_files": 20, "tags": ["pytorch", "typescript", "deps", "cuda", "html", "package", "training", "pytest", "python", "build", "vitest", "torch", "fastapi", "react", "jest", "plugin"]}
+{"ts": 1778256291.050365, "phase": "integrate", "rounds": 1, "n_files": 20, "tags": ["pytorch", "typescript", "deps", "cuda", "html", "package", "training", "pytest", "python", "build", "vitest", "torch", "fastapi", "react", "jest", "plugin"]}
+{"ts": 1778639171.3893492, "phase": "plan", "rounds": 3, "n_files": 13, "tags": ["build", "sqlite", "python", "pytest"]}
+{"ts": 1778639171.3943968, "phase": "deps", "rounds": 1, "n_files": 13, "tags": ["build", "sqlite", "python", "pytest"]}
+{"ts": 1778639171.3960845, "phase": "scaffold", "rounds": 7, "n_files": 13, "tags": ["build", "sqlite", "python", "pytest"]}
+{"ts": 1778639171.3979774, "phase": "build", "rounds": 66, "n_files": 13, "tags": ["build", "sqlite", "python", "pytest"]}
+{"ts": 1778639171.3995597, "phase": "review", "rounds": 6, "n_files": 13, "tags": ["build", "sqlite", "python", "pytest"]}
+{"ts": 1778639171.4011567, "phase": "integrate", "rounds": 9, "n_files": 13, "tags": ["build", "sqlite", "python", "pytest"]}
+{"ts": 1778639742.784678, "phase": "plan", "rounds": 4, "n_files": 7, "tags": ["build", "css", "html", "pytest", "flask", "python", "sqlite"]}
+{"ts": 1778639742.7896504, "phase": "deps", "rounds": 1, "n_files": 7, "tags": ["build", "css", "html", "pytest", "flask", "python", "sqlite"]}
+{"ts": 1778639742.7913263, "phase": "scaffold", "rounds": 7, "n_files": 7, "tags": ["build", "css", "html", "pytest", "flask", "python", "sqlite"]}
+{"ts": 1778639742.7929766, "phase": "review", "rounds": 4, "n_files": 7, "tags": ["build", "css", "html", "pytest", "flask", "python", "sqlite"]}
+{"ts": 1778640835.226333, "phase": "plan", "rounds": 4, "n_files": 6, "tags": ["cargo", "rust", "deps", "build", "deep"]}
+{"ts": 1778640835.2310898, "phase": "deps", "rounds": 2, "n_files": 6, "tags": ["cargo", "rust", "deps", "build", "deep"]}
+{"ts": 1778640835.2328925, "phase": "scaffold", "rounds": 5, "n_files": 6, "tags": ["cargo", "rust", "deps", "build", "deep"]}
+{"ts": 1778640835.238254, "phase": "review", "rounds": 6, "n_files": 6, "tags": ["cargo", "rust", "deps", "build", "deep"]}
+{"ts": 1778640835.2400336, "phase": "build", "rounds": 51, "n_files": 6, "tags": ["cargo", "rust", "deps", "build", "deep"]}
+{"ts": 1778640835.2418065, "phase": "integrate", "rounds": 5, "n_files": 6, "tags": ["cargo", "rust", "deps", "build", "deep"]}
+{"ts": 1779065288.8221292, "phase": "plan", "rounds": 2, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.824196, "phase": "deps", "rounds": 1, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.8258805, "phase": "scaffold", "rounds": 15, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.8275812, "phase": "build", "rounds": 107, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.8293202, "phase": "integrate", "rounds": 60, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.8310573, "phase": "wiring", "rounds": 6, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.8327177, "phase": "review", "rounds": 6, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779065288.8344119, "phase": "validate", "rounds": 1, "n_files": 20, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.942293, "phase": "plan", "rounds": 2, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.9445968, "phase": "deps", "rounds": 1, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.9475346, "phase": "scaffold", "rounds": 15, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.9505575, "phase": "build", "rounds": 57, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.9528587, "phase": "review", "rounds": 6, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.9557312, "phase": "integrate", "rounds": 21, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779067183.9588203, "phase": "wiring", "rounds": 3, "n_files": 22, "tags": ["flask", "sqlite"]}
+{"ts": 1779068681.870973, "phase": "plan", "rounds": 2, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779068681.876064, "phase": "deps", "rounds": 1, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779068681.8780346, "phase": "scaffold", "rounds": 16, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779068681.8798094, "phase": "build", "rounds": 72, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779068681.881496, "phase": "review", "rounds": 6, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779068681.883137, "phase": "integrate", "rounds": 6, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779068681.8847997, "phase": "wiring", "rounds": 1, "n_files": 22, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.2856855, "phase": "plan", "rounds": 2, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.2879019, "phase": "deps", "rounds": 1, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.289642, "phase": "scaffold", "rounds": 18, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.2914157, "phase": "build", "rounds": 46, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.2931416, "phase": "integrate", "rounds": 109, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.294903, "phase": "wiring", "rounds": 5, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.2966328, "phase": "review", "rounds": 6, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779070460.2983987, "phase": "validate", "rounds": 1, "n_files": 21, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.1921263, "phase": "plan", "rounds": 2, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.1941357, "phase": "deps", "rounds": 1, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.1958857, "phase": "scaffold", "rounds": 24, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.1975348, "phase": "build", "rounds": 85, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.1992555, "phase": "integrate", "rounds": 377, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.200962, "phase": "wiring", "rounds": 5, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.2026918, "phase": "review", "rounds": 6, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779080578.2043457, "phase": "validate", "rounds": 1, "n_files": 29, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.6837292, "phase": "plan", "rounds": 4, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.685862, "phase": "deps", "rounds": 1, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.6878097, "phase": "scaffold", "rounds": 13, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.6895568, "phase": "review", "rounds": 6, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.691194, "phase": "build", "rounds": 42, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.6928673, "phase": "integrate", "rounds": 6, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779084581.6944623, "phase": "validate", "rounds": 1, "n_files": 14, "tags": ["sqlite", "flask"]}
+{"ts": 1779085988.7453673, "phase": "plan", "rounds": 2, "n_files": 18, "tags": ["flask", "sqlite"]}
+{"ts": 1779085988.7502856, "phase": "deps", "rounds": 1, "n_files": 18, "tags": ["flask", "sqlite"]}
+{"ts": 1779085988.7520814, "phase": "scaffold", "rounds": 1, "n_files": 18, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1688704, "phase": "plan", "rounds": 2, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1708179, "phase": "deps", "rounds": 1, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1724353, "phase": "scaffold", "rounds": 16, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1739073, "phase": "build", "rounds": 66, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1754253, "phase": "review", "rounds": 6, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1770356, "phase": "integrate", "rounds": 137, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1786275, "phase": "wiring", "rounds": 6, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779089766.1801155, "phase": "validate", "rounds": 1, "n_files": 25, "tags": ["flask", "sqlite"]}
+{"ts": 1779741506.4628577, "phase": "plan", "rounds": 2, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.464767, "phase": "deps", "rounds": 1, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.4663887, "phase": "scaffold", "rounds": 12, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.4679747, "phase": "build", "rounds": 87, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.4695604, "phase": "review", "rounds": 6, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.4710839, "phase": "integrate", "rounds": 181, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.4726756, "phase": "wiring", "rounds": 11, "n_files": 17, "tags": ["sqlite", "flask"]}
+{"ts": 1779741506.474242, "phase": "validate", "rounds": 1, "n_files": 17, "tags": ["sqlite", "flask"]}
