@@ -15,9 +15,9 @@
 
 ![Python](https://img.shields.io/badge/python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/typescript-5.x-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-320%20passing-2ea44f?style=flat-square)
-![Builds](https://img.shields.io/badge/applications%20built-92-blue?style=flat-square)
-![Lessons](https://img.shields.io/badge/lessons%20learned-275-purple?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-616%20passing-2ea44f?style=flat-square)
+![Builds](https://img.shields.io/badge/applications%20built-146-blue?style=flat-square)
+![Lessons](https://img.shields.io/badge/lessons%20learned-403-purple?style=flat-square)
 ![License](https://img.shields.io/badge/license-private-red?style=flat-square)
 
 </div>
@@ -100,8 +100,8 @@ Each letter ties to a *named subsystem in the codebase* — every word is someth
 | **A** | **Autonomous** | One sentence in, working app out. Picks file order, retry counts, timeouts, version pins — without asking. The harness's job is to never push a decision back to the user when it can be inferred. | `engine.run` (the `while True` phase loop) |
 | **D** | **Decomposing** | 15+ file projects are decomposed into dependency-sorted modules, built in waves. Each module gets a scoped executor that can only touch its own directory. | `modules.ModularPlan` · `engine._build_module_wave` · `tools.ModuleScopedExecutor` |
 | **I** | **Iterative** | Every validation failure feeds back as `retreat_to_build`. The state machine doesn't fail — it loops with new context until the 10-check gate goes green or budget runs out. | `phases.PhaseState.retreat_to_build` |
-| **L** | **Learning** | `memory.jsonl` accumulates lessons (275 today, tag-filtered, confidence-scored, decay-aware). `phase_budgets.jsonl` records rounds-per-phase so the next build's budget is computed from the previous one's reality. | `memory.recall` · `memory.record_phase_outcome` |
-| **L** | **Lifecycle** | Full **PLAN → DEPS → SCAFFOLD → REVIEW → BUILD → INTEGRATE → VALIDATE → PACKAGE** pipeline. Not "code generation" — *application lifecycle*. The output is a packaged, runnable project with README and dep manifest. | `phases.Phase` · `phases.PHASE_ORDER` |
+| **L** | **Learning** | `memory.jsonl` accumulates lessons (403 today, tag-filtered, source-task-aware decay, confidence-scored). `phase_budgets.jsonl` records rounds-per-phase so the next build's budget is computed from the previous one's reality. The `improve` cycle audits cadillac's own source against a test matrix, proposes patches, and writes meta-lessons when the matrix score lifts. | `memory.recall` · `memory.record_phase_outcome` · `improve.applier.commit_applied` |
+| **L** | **Lifecycle** | Full **SPEC → PLAN → DEPS → SCAFFOLD → REVIEW → BUILD → INTEGRATE → WIRING → VALIDATE → CRITIC → RUNTIME → PACKAGE** pipeline, wrapped in a progressive-tier outer loop. Not "code generation" — *application lifecycle*. The output is a packaged, runnable project verified against real flows, not just unit tests. | `phases.Phase` · `phases.PHASE_ORDER` · `engine.run` |
 | **A** | **Adaptive** | Every meaningful value is derived from a signal cadillac already sees. Timeouts from `cmd_history.jsonl`. Context budgets from `/v1/models`. Version pins from `node --version`. Phase budgets from p90 of past rounds. The user never tunes any of this. | `tools._adaptive_timeout` · `engine.compute_context_budget` · `inspector.approved_versions_for_host` · `phases.compute_budgets` |
 | **C** | **Compiler** | Task description in. **Validated** application out. Like a compiler, the artifact must pass an uncompromising check before it's emitted. Like a compiler, the output is deterministic given the same input + memory state + seed. | `validate.run_validation` (the 10-check gate) |
 
@@ -112,22 +112,32 @@ Each letter ties to a *named subsystem in the codebase* — every word is someth
 ## 🔧 How it works
 
 ```
-┌─────────┐   ┌──────┐   ┌──────────┐   ┌────────┐   ┌───────┐   ┌─────────────┐   ┌──────────┐   ┌─────────┐
-│  PLAN   │ → │ DEPS │ → │ SCAFFOLD │ → │ REVIEW │ → │ BUILD │ → │  INTEGRATE  │ → │ VALIDATE │ → │ PACKAGE │
-└─────────┘   └──────┘   └──────────┘   └────────┘   └───────┘   └─────────────┘   └──────────┘   └─────────┘
-   plan       npm/pip      stub files    adversarial    fix         glue            10-check        README +
-   modular?   install                    critic         cycle       phase           pipeline        deps file
+        ┌──────┐                                                                       ┌──────────┐
+        │ SPEC │ ── must / should / could user stories (LLM expanded from one sentence)│ PACKAGE  │
+        └──┬───┘                                                                       └──────────┘
+           ▼                                                                                ▲
+  ┌─────┐  ┌──────┐  ┌──────────┐  ┌────────┐  ┌───────┐  ┌───────────┐  ┌────────┐  ┌──────────┐  ┌────────┐  ┌─────────┐
+  │PLAN │→ │ DEPS │→ │ SCAFFOLD │→ │ REVIEW │→ │ BUILD │→ │ INTEGRATE │→ │ WIRING │→ │ VALIDATE │→ │ CRITIC │→ │ RUNTIME │
+  └─────┘  └──────┘  └──────────┘  └────────┘  └───────┘  └───────────┘  └────────┘  └──────────┘  └────────┘  └─────────┘
+  plan +   npm/pip   stub files    adversarial  fix        glue           cross-     12-check      complete-   real HTTP
+  spec     install                 critic       cycle      phase          layer      pipeline      ness        flows /
+  modular?                                                                HTTP                     audit       CLI runs /
+                                                                          smoke      tier 1: must            lib usage
+                                                                                     tier 2: must+should
+                                                                                     (could on --full-spec)
 ```
 
 **Flat pipeline** — for projects with fewer than 15 files. One agent, one manifest. Everything happens in a single phase loop.
 
 **Modular pipeline** — for 15+ files. Plan is decomposed into modules, sorted by dependency, built in waves. Each module gets its own scoped executor (can only write to its directory), its own scratch file, its own code-map. Cross-module visibility happens through AST-extracted interfaces from already-built upstream modules.
 
-Both pipelines share the same phase state machine, adaptive budgets, memory, and validation gate.
+**Progressive tiers** — for any build with a non-trivial spec. Tier 1 builds the must-stories and must go green through VALIDATE + CRITIC + RUNTIME before tier 2 layers should-stories onto the green base. A long build that fails on a hard should-story still ships the must tier. `--full-spec` adds tier 3 (could-priority).
+
+All pipelines share the same phase state machine, adaptive budgets, memory, validation gate, completeness audit, and runtime probe.
 
 ---
 
-## ✅ The 10-check validation gate
+## ✅ The 12-check validation gate
 
 ```
 ┌──────────────┬──────────────────────────────────────────────────────────────────┐
@@ -135,30 +145,96 @@ Both pipelines share the same phase state machine, adaptive budgets, memory, and
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  imports     │  every import resolves to stdlib, declared dep, or local module │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  static_names│  pyflakes scans for undefined-name bugs that NameError at        │
+│  static_names│  pyflakes scans for undefined-name bugs that NameError at       │
 │              │  runtime — catches "InputPoller used but not imported" pre-run  │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
 │  lint        │  ruff / eslint with auto-configured safe rule set                │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  framework   │  Flask routes registered? React app.mount? type:module set?      │
+│  security    │  static OWASP-class scan: sql_fstring, shell_true_with_interp,  │
+│              │  hardcoded_secret, weak_crypto, tls_verify_false, etc. with     │
+│              │  context-aware false-positive guards (PRAGMA / `{placeholders}` │
+│              │  / `{set_clauses}` parameterized idioms are NOT flagged)        │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  functional  │  build artifact produced (vite build, tsc --build, etc.)         │
+│  operational │  deploy-readiness probes — schema_integrity (NOT NULL columns   │
+│              │  vs literal None at INSERT sites), missing_env (boots backend   │
+│              │  with required env stripped, expects fail-fast naming the var), │
+│              │  sigterm_responsiveness (5s clean shutdown after SIGTERM)       │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  run         │  entry point executes a smoke-test invocation cleanly            │
+│  framework   │  Flask routes registered? React app.mount? type:module set?    │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  smoke_run   │  for curses/pygame apps: monkey-patches a fake screen, runs the │
-│              │  REAL no-args entry path 60 frames — catches the broken main()  │
+│  functional  │  AST-parse __init__.py re-exports; verify each name resolves    │
+│              │  to a real symbol in the package                                 │
+├──────────────┼──────────────────────────────────────────────────────────────────┤
+│  run         │  entry point executes a smoke-test invocation cleanly           │
+├──────────────┼──────────────────────────────────────────────────────────────────┤
+│  smoke_run   │  for curses/pygame apps: monkey-patches a fake screen, runs    │
+│              │  the REAL no-args entry path 60 frames — catches broken main() │
 │              │  paths that --test mode bypasses                                 │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  tests       │  pytest / vitest / jest all green                                │
+│  tests       │  pytest / vitest / jest all green                               │
 ├──────────────┼──────────────────────────────────────────────────────────────────┤
-│  naming      │  plan's declared module names match the filesystem               │
+│  naming      │  plan's declared module names match the filesystem              │
 └──────────────┴──────────────────────────────────────────────────────────────────┘
 ```
 
-Failing a check triggers retreat-to-BUILD, up to `max_validate_retries` cycles. When all 10 pass, `PACKAGE` writes the README and `requirements.txt` / `package.json`.
+Failing a check triggers retreat-to-BUILD, up to `max_validate_retries` cycles. Same fingerprint repeated 3× triggers **surgical mode** (see Resilience layers). When all 12 pass, the build proceeds to CRITIC, then RUNTIME, then PACKAGE.
 
-The two newest checks (`static_names`, `smoke_run`) close a recurring failure mode: code reachable from `main()` but not from `--test` would slip through every other check and crash on first launch. `static_names` catches the bulk via pyflakes (undefined names); `smoke_run` walks the actual interactive entry path with a fake stdscr to catch what static can't see.
+The newest checks address recurring deploy-time failure classes:
+
+- `operational` — caught PingFlux's `status_code INTEGER NOT NULL` receiving `None` from a network-failure path; flags backends that silently accept missing required env vars (operators learn the bug from a crashloop instead of a clear error)
+- `security` — context-aware false-positive guards mean the parameterized-fragment idiom `f"WHERE x IN ({placeholders})"` and SQLite's non-parameterizable `f"PRAGMA {name}={value}"` are no longer flagged as SQL injection
+- `functional` — was line-based regex on `__init__.py` (silently mis-reading multi-line `from .x import (...)` as exporting `(` as a name); now ast-parses
+
+---
+
+## 🛡 Resilience layers
+
+Five mechanisms sit between BUILD and PACKAGE so a build that almost made it doesn't die at the finish line.
+
+#### 📝 SPEC — explicit user stories from a terse task
+
+Before PLAN, an LLM call expands one-sentence tasks into 15-40 structured `Story` objects with `priority ∈ {must, should, could}`, `acceptance` criteria, and `category`. Stored to `<workspace>/spec.json`. Architecture, manifest, and BUILD prompts all see the spec — so the build has an explicit target, not the LLM's improvised interpretation.
+
+> *"Build a habit tracker"* expanded to 25 stories on a recent run — including password reset, input sanitization, future-date validation, and graceful HTTP error codes. Things a typical one-shot build silently skips.
+
+Source: `cadillac/spec.py` · `cadillac/critic.py`
+
+#### 🔍 CRITIC — completeness audit after VALIDATE green
+
+Two-stage: a static keyword prefilter flags stories whose terms never appear in the workspace; for ambiguous remainder, an LLM second-opinion compares the spec against the codemap + manifest. Actionable gaps (must / should priority) bounce to BUILD for a completion pass. Cap: one critic-driven retreat per build.
+
+Real example from a build last week: VALIDATE green on all checks; CRITIC scored `0.86` and flagged S03 (`User logs out`), S10 (`Delete habit`), S18 (`Profile retrieval`) as missing. The LLM added them on the bounce-back pass.
+
+#### 🌐 RUNTIME — drive real flows against the live artifact
+
+After CRITIC clean, runtime verification picks a strategy by language family + project shape:
+
+| Strategy | When | Probe shape |
+|---|---|---|
+| **http** | Flask/FastAPI/Express detected | Chained HTTP flows: signup → grab token → call protected route, with capture + status + body subset assertions |
+| **cli** | Runnable binary, no HTTP listener | Scripted `argv` + `stdin` runs with exit-code and stdout substring assertions |
+| **library** | Public API surface, no entry runner | Short runnable usage snippets that import from the package and assert on return values |
+| **skip** | Static site / WordPress / browser extension / interactive | No surface to drive |
+
+The HTTP runner reuses validate.py's WIRING boot infrastructure (process group, listening wait, group-kill teardown). Catches the bugs unit tests and code review can't see — "logout returns 200 OK but the token still works", "mark-done returns 200 but `last_completed` stays null".
+
+Source: `cadillac/runtime/__init__.py` (orchestrator) · `cadillac/runtime/{http,cli,library}_runner.py` · `cadillac/runtime/types.py`
+
+#### 🩺 Surgical mode — stuck-loop detection + targeted fix
+
+Validation failures get fingerprinted by `check_name:file:line:error_class`. Same fingerprint across 3 consecutive retries triggers a focused single-file edit pass with ~500 tokens of context (not the usual 30K). For `undefined name` errors specifically, the prompt is augmented with the file's existing imports, a workspace grep for `class X`/`def X`/`X = ...` candidates, and sibling `__init__.py` exports — so the LLM can pick the right import to add instead of renaming to another undefined symbol. Cap: one surgical attempt per fingerprint.
+
+> A build that died at retry 5/5 on `undefined name 'clean_email'` would today be unstuck in retry 3 by surgical mode, with a 1-line edit.
+
+Source: `cadillac/surgical.py`
+
+#### 🪜 Progressive tiers — must → should → could
+
+Instead of building all 25 stories in one shot, the engine slices into priority tiers. Tier 1 (must) builds first; VALIDATE + CRITIC + RUNTIME must all clear before tier 2 (must+should) layers should-stories onto the green base. Tier 3 (could) only runs with `--full-spec`. Per-tier resets of CRITIC/RUNTIME/surgical flags so each tier re-evaluates its surface.
+
+A 30-story build that fails on a hard should-story still ships the must tier. The catastrophe footprint of one bad story shrinks to one tier instead of one build.
+
+Source: `cadillac/phases.py:PhaseState.{current_tier,validate_retries,...}` · `cadillac/engine.py:run()` outer tier loop
 
 ---
 
@@ -200,7 +276,7 @@ Five views, keyboard-switched:
 | Key | View | Shows |
 |:--:|---|---|
 | *(default)* | **Projects** | List of workspaces, validation summary, file progress, lessons applied |
-| `m` | **Memory** | 275 accumulated lessons, top by confidence, tag histogram, do/don't split |
+| `m` | **Memory** | 403 accumulated lessons, top by confidence, tag histogram, do/don't split, cross-task decay annotations |
 | `b` | **Budgets** | Phase-history stats: mean / p90 / max rounds per (tag-bucket, phase) |
 | `e` | **Events** | Live tail of selected workspace's `.cadillac/build.jsonl` |
 | `?` | **Help** | Key reference |
@@ -245,11 +321,19 @@ Every reflection cycle (success **or** failure) extracts entries:
   "tags": ["typescript", "vitest", "node"],
   "polarity": "do",
   "confidence": 0.85,
-  "used": 7
+  "used": 7,
+  "source_task": "Build a React + Vite SPA with vitest tests"
 }
 ```
 
-Before each build, `recall(task)` scores them by **tag-filter + keyword-overlap + recency + confidence** and injects the top 10 into the system prompt. Lessons whose triggers appear in fresh errors *lose* confidence (`penalize_backfired`); lessons that survive an applied build *gain* it.
+Before each build, `recall(task)` scores them by **tag-filter + keyword-overlap + recency + confidence + cross-task decay** and injects the top 10 into the system prompt. Lessons whose triggers appear in fresh errors *lose* confidence (`penalize_backfired`); lessons that survive an applied build *gain* it.
+
+The 2026-05-26 hygiene pass added two precision controls:
+
+- **`source_task` decay**: lessons whose originating task has zero stack-tag overlap with the current task get a 5× score penalty. Stops top-used IRC-server lessons (formerly used 87×) from dominating recall on unrelated builds.
+- **Content tag inference**: `infer_tags_from_text` expands library mentions to canonical stack tags (`aiosqlite` → `{python, sqlite, asyncio}`). New lessons can't land untagged anymore (parse_reflection backfills from body text when the caller omits).
+- **Fresh-lesson floor**: new reflection lessons start at confidence 0.3 (was 0.5). Requires 2+ successful reinforcements before outweighing the scoring noise floor.
+- **Meta-lessons**: when `cadillac improve` lands a patch and the matrix score lifts ≥0.05, the applier writes an `architecture` lesson tagged `[cadillac, self]` capturing what worked.
 
 #### `phase_budgets.jsonl` — rounds-per-phase history
 
@@ -283,28 +367,43 @@ In modular builds, `ToolExecutor` is wrapped by `ModuleScopedExecutor` — file 
 
 ```
 cadillac/
-├── 🎛  engine.py          ~3100 lines — phase state machine, chat loop, modular orchestration
+├── 🎛  engine.py          ~3500 lines — phase state machine, chat loop, modular orchestration,
+│                                         tier loop, stuck-loop detection, CRITIC + RUNTIME wiring
 ├── 🧱  modules.py         ModuleSpec, ModularPlan, dependency topo-sort, cycle detection
 ├── 📝  prompts.py         LLM templates for each phase (flat + modular variants)
 ├── 🔨  tools.py           ToolExecutor + ModuleScopedExecutor, sandboxed I/O
-├── ✅  validate.py        The 10-check pipeline, per-language validators
-├── 🎯  phases.py          Phase enum, budgets, PhaseState, retry logic
+├── ✅  validate.py        The 12-check pipeline + WIRING dynamic probe + contract alignment
+├── 🩺  operational.py     Deploy-readiness gates — schema integrity / missing-env / SIGTERM
+├── 📝  spec.py            Story + Spec dataclasses, generate_spec(), Spec.subset() for tiers
+├── 🔍  critic.py          Completeness audit: static prefilter + LLM second opinion
+├── 🌐  runtime/           Runtime verification package
+│      ├── __init__.py    Orchestrator + strategy dispatch
+│      ├── types.py       Probe / ProbeFailure / VerificationResult
+│      ├── format.py      Shared `format_for_iterate(failures)` builder
+│      ├── http_runner.py Flow / FlowStep, generate from spec+contract, drive live backend
+│      ├── cli_runner.py  ScriptedRun, generate from spec+entry, scripted subprocess
+│      └── library_runner.py UsageExample, generate snippets for Python/Node/Rust libs
+├── 🪜  surgical.py        Stuck-loop targeted fix — name resolution hints, edit + re-check
+├── 📜  contracts.py       Contract + Endpoint, the artifact both sides import from
+├── 🎯  phases.py          Phase enum, budgets, PhaseState (tier + stuck + critic + runtime flags)
 ├── 📋  manifest.py        Thread-safe file registry with structural summaries
 ├── 🔍  inspector.py       3-tier building-code enforcement (materials/wiring/commissioning)
 ├── 🗺️  codemap.py         Tiered source representation (AST tier 1 → regex tier 2 → raw tier 3)
-├── 🧠  memory.py          Lesson accumulation, tag-aware recall, phase-budget history
+├── 🧠  memory.py          Lessons + tag-aware recall + cross-task decay + meta-lessons
 ├── 📓  scratch.py         Per-module within-build scratch files
-├── 🌐  languages.py       Python + TypeScript strategy (react/vue/angular detection)
-├── 📐  quality.py         Coding standards, anti-patterns, few-shot examples
+├── 🌐  languages.py       Python + TypeScript + Go + Rust + WordPress + browser-ext + PyTorch
+├── 📐  quality.py         Coding standards, anti-patterns, few-shot examples per stack
+├── 🛡  adversarial.py     Second-LLM-pass test generation, objective-driven probes
 ├── 🖥️  display.py         Rich live terminal UI (file tree + activity log + validation)
 ├── 📡  events.py          Structured events decoupling engine from display
 ├── 📈  progress.py        progress.md writer + compact LLM context
 ├── 📊  dash.py            Zero-service TUI dashboard (this README ↑)
 ├── 💻  cli.py             Interactive shell, workspace resolution
-├── ⚙️   cadillac.py       CLI entry point (argparse)
-├── 💾  memory.jsonl       275 accumulated lessons
+├── ⚙️   cadillac.py       CLI entry point (argparse) — --full-spec, --parallel, etc.
+├── 🔁  improve/           Self-improvement cycle — audit / probe / correlate / propose / apply
+├── 💾  memory.jsonl       403 accumulated lessons (tag-filtered, source-task-aware)
 ├── 📚  phase_budgets.jsonl   Cross-build phase-round history
-└── 🧪  tests/             307 unit tests covering all of the above
+└── 🧪  tests/             616 unit tests covering all of the above
 ```
 
 ---
@@ -342,6 +441,7 @@ cadillac                                     # interactive shell
 | `--rate` | Client-side rate-limit (default `0.25` RPS, 0 disables) |
 | `--parallel` | Build independent modules in parallel waves |
 | `--max-iterations` | Outer auto-iterate cycles after first validation (default 3) |
+| `--full-spec` | Include tier 3 (could-priority stories). Default: must + should only, to bound build wall time. |
 
 Everything else is automatic. By design.
 
@@ -393,6 +493,18 @@ be either built fresh or repaired in place — both reach all-green.*
 8 files · 12 Jest tests · all 8 validations PASS · ~2 minutes
 ```
 
+#### 🎯 Flask Habit Tracker — first full-resilience-stack build
+
+```
+17 files · 290 rounds · 92 minutes · status: COMPLETE
+2-tier progressive: tier 1 (must, 12 stories) → tier 2 (must+should, 22 stories)
+CRITIC + RUNTIME each fired twice (once per tier)
+RUNTIME http-strategy: 16 + 20 real flows generated and exercised
+Found and reported behavioral gaps that unit tests + adversarial + WIRING all missed:
+  - logout returned 200 but the token kept working
+  - mark-done returned 200 but `last_completed` stayed null
+```
+
 ---
 
 ## 📊 By the numbers
@@ -401,9 +513,10 @@ be either built fresh or repaired in place — both reach all-green.*
 
 | | |
 |:---:|:---:|
-| **92** applications built | **307** unit tests passing |
-| **275** lessons accumulated | **15+** framework bugs fixed in 1 session |
-| **8/8** validations on full-stack React+Flask+SQLite | **0** required CLI config flags |
+| **146** applications built | **616** unit tests passing |
+| **403** lessons accumulated | **15+** framework bugs fixed in 1 session |
+| **12/12** validation checks + SPEC + CRITIC + RUNTIME | **0** required CLI config flags |
+| **2-tier progressive build** (must / must+should) | **1×** surgical mode per stuck fingerprint |
 
 </div>
 
@@ -454,26 +567,43 @@ Each module gets a `ModuleScopedExecutor` allowed to `write_file`, `edit_file`, 
 ## 🛠 Development
 
 ```bash
-# Run the full test suite (~2 seconds)
+# Run the full test suite (~14 seconds, 616 tests)
+python3 -m unittest discover -s cadillac/tests -q
+
+# Run the resilience-layer tests specifically
 python3 -m unittest \
-    cadillac.tests.test_post_test_fixes \
-    cadillac.tests.test_scratch \
-    cadillac.tests.test_memory \
-    cadillac.tests.test_modules \
-    cadillac.tests.test_dash
+    cadillac.tests.test_spec_critic \
+    cadillac.tests.test_runtime_dispatch \
+    cadillac.tests.test_runtime_http \
+    cadillac.tests.test_runtime_cli \
+    cadillac.tests.test_runtime_library \
+    cadillac.tests.test_operational \
+    cadillac.tests.test_surgical \
+    cadillac.tests.test_progressive_tiers
 
 # Quick import check after edits
-python3 -c "from cadillac import engine, dash, validate, memory"
+python3 -c "from cadillac import engine, dash, validate, memory, spec, critic, surgical, operational; from cadillac.runtime import runtime_verify"
 ```
 
-Workspaces land in `$CWD/workspace-YYYYMMDD-HHMMSS/`. Each has a `.cadillac/` subdirectory:
+Workspaces land in `$CWD/workspace-YYYYMMDD-HHMMSS/`. Each has both a top-level `spec.json` and a `.cadillac/` subdirectory:
 
 ```
-.cadillac/
-├── build.jsonl          # append-only event log (every phase, every tool call)
-├── cmd_history.jsonl    # adaptive-timeout signal source
-├── scratch.md           # within-build LLM notes
-└── checkpoint.json      # resume state
+workspace-YYYYMMDD-HHMMSS/
+├── spec.json                  # SPEC output — user stories the build targets
+├── contracts.json             # API contract for full-stack builds
+├── architecture.md            # PLAN output
+├── plan.json                  # manifest of files to write
+├── progress.md                # human-readable phase trace
+└── .cadillac/
+    ├── build.jsonl            # append-only event log (every phase, every tool call)
+    ├── cmd_history.jsonl      # adaptive-timeout signal source
+    ├── scratch.md             # workspace-level within-build LLM notes
+    ├── checkpoint.json        # resume state
+    ├── flows.json             # runtime/http: generated Flow objects
+    ├── cli_runs.json          # runtime/cli: generated ScriptedRun objects
+    ├── usage_examples.json    # runtime/library: generated UsageExample snippets
+    ├── adversarial/           # adversarial probe tests
+    └── modules/               # per-module checkpoints (modular builds)
 ```
 
 To pair cadillac against a new LLM endpoint, no config file is required — just pass `--api-url` and optionally `--model`. Context window, model identity, and cross-call pacing are all auto-detected.
