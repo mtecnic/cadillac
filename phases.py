@@ -50,6 +50,27 @@ class PhaseState:
     # retries and then advise+continue rather than infinite-loop.
     adversarial_retries: int = 0
     max_adversarial_retries: int = 2
+    # Completeness critic runs once per build after VALIDATE first goes green.
+    # Set to True before the critic-driven iterate retreat, so a confused critic
+    # cannot loop the build indefinitely.
+    completeness_critic_done: bool = False
+    # Runtime verification (HTTP / CLI / library flows) runs once per build,
+    # after CRITIC. Same single-retreat cap pattern — flag prevents a confused
+    # runtime probe from looping the build.
+    runtime_verify_done: bool = False
+    # Stuck-loop detection: tracks the set of validation-failure fingerprints
+    # observed across the most recent N=5 VALIDATE retries. When the same
+    # fingerprint appears in the latest 3 retries, the engine triggers
+    # cadillac.surgical.surgical_fix() on that error before retreating to
+    # BUILD again. `surgical_fixes_attempted` caps: a given fingerprint may
+    # trigger surgical mode at most once per build.
+    stuck_fingerprints: list = field(default_factory=list)
+    surgical_fixes_attempted: set = field(default_factory=set)
+    # Progressive-scope tiers: the build first satisfies `must` stories, then
+    # `must+should`, then optionally `must+should+could`. Each tier resets
+    # the CRITIC, RUNTIME, and stuck-loop flags so they re-fire on the new
+    # surface. `current_tier` is the active tier label.
+    current_tier: str = "all"
     fix_required: bool = False  # True after retreat_to_build until first edit lands
     fix_mode_rounds_no_edit: int = 0  # Counts BUILD rounds while fix_required with no successful edit
     # Rounds spent in each phase; captured on advance() so end-of-build reporting

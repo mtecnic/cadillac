@@ -1009,12 +1009,35 @@ def _auth_headers(cfg: Config) -> dict:
 
 
 def detect_model(cfg: Config) -> str:
-    resp = requests.get(f"{cfg.api_url}/models", headers=_auth_headers(cfg), timeout=10)
-    resp.raise_for_status()
-    data = resp.json().get("data", [])
-    if not data:
-        raise RuntimeError(f"No models available at {cfg.api_url}")
-    return data[0]["id"]
+    """Discover a model name from the endpoint. Retries on transient errors.
+
+    Previously a single 10s connect-timeout fail killed builds before they
+    started. A WiFi handoff, a vLLM reload, a brief packet loss event — any
+    of those would lose a 1-hour build before round 1. Three attempts with
+    exponential backoff are enough to ride out the common cases without
+    masking a truly-dead endpoint (caller still sees the original requests
+    exception after the last attempt).
+    """
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{cfg.api_url}/models",
+                                headers=_auth_headers(cfg), timeout=15)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            if not data:
+                raise RuntimeError(f"No models available at {cfg.api_url}")
+            return data[0]["id"]
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # 1s, 2s
+                continue
+            raise
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"detect_model failed at {cfg.api_url}")
 
 
 def estimate_tokens(text: str | None) -> int:
@@ -2667,6 +2690,54 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
     architecture_text = ""
     review_issues = ""  # Issues found during CRITIC, passed to BUILD
     critic_findings: list[dict] = []  # Structured findings from CRITIC phase
+    # SPEC: expand the terse task into user stories once, persist to spec.json,
+    # and inject into prompts so the build sees the explicit target. On iterate/
+    # resume the existing spec.json is reused (no drift between runs). When the
+    # LLM fails to produce a parseable spec, this becomes an empty Spec and all
+    # downstream paths fall back to pre-spec behavior.
+    from .spec import Spec, generate_spec
+    spec = Spec.load(workspace)
+    if spec is None or spec.is_empty():
+        spec = generate_spec(task, cfg, lang, emit=emit)
+        spec.save(workspace)
+    else:
+        emit("log", msg=f"[SPEC] reused existing spec.json ({len(spec.stories)} stories)")
+
+    # Progressive tiers: build must-stories first to green VALIDATE before
+    # adding should-stories (and optionally could). Each tier resets the
+    # CRITIC / RUNTIME / stuck-loop flags so they re-fire on the new surface.
+    # Tier 3 (`could`) only runs when --full-spec was requested.
+    _full_spec_requested = getattr(cfg, "full_spec", False)
+    def _build_tiers(s) -> list[tuple[str, "Spec"]]:
+        out: list[tuple[str, "Spec"]] = []
+        has_must = any(st.priority == "must" for st in s.stories)
+        has_should = any(st.priority == "should" for st in s.stories)
+        has_could = any(st.priority == "could" for st in s.stories)
+        if not s.stories:
+            return out
+        if has_must:
+            out.append(("must", s.subset(("must",))))
+        if has_should:
+            out.append(("must+should", s.subset(("must", "should"))))
+        elif not has_must:
+            # Only could-priority stories — fall back to single tier.
+            out.append(("all", s))
+        if has_could and _full_spec_requested:
+            out.append(("must+should+could", s))
+        return out
+
+    _tiers = _build_tiers(spec) if not spec.is_empty() else []
+    _tier_index = 0
+    if _tiers:
+        current_tier_name, current_tier_spec = _tiers[0]
+        spec_block = current_tier_spec.to_prompt_block()
+        state.current_tier = current_tier_name
+        emit("log", msg=(
+            f"[TIER] starting tier 1/{len(_tiers)}: {current_tier_name} "
+            f"({len(current_tier_spec.stories)} stories)"
+        ))
+    else:
+        spec_block = spec.to_prompt_block()
     entry_point = lang.entry_point
     messages: list[dict] = []
     no_tool_rounds = 0
@@ -2779,6 +2850,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                         emit("log", msg="[PLAN] Using modular architecture prompt")
                     else:
                         arch_prompt = build_architecture_prompt(lessons_text, lang=lang)
+                    # Inject spec so the architect sees the explicit target.
+                    if spec_block:
+                        arch_prompt += "\n\n" + spec_block
                     if replan_hint:
                         arch_prompt += replan_hint
                         replan_hint = ""
@@ -2792,6 +2866,8 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                         if not use_modular and _should_use_modular(architecture_text):
                             emit("log", msg="[PLAN] Architecture suggests modular project, re-generating...")
                             arch_prompt = build_modular_architecture_prompt(lessons_text, lang=lang)
+                            if spec_block:
+                                arch_prompt += "\n\n" + spec_block
                             msgs = _build_messages(arch_prompt, task)
                             msg = chat(cfg, msgs, tools=[], emit=emit)
                             architecture_text = (msg.get("content") or "").strip()
@@ -2825,6 +2901,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                         else:
                             emit("log", msg="[PLAN] Building manifest from architecture...")
                         manifest_prompt = build_manifest_prompt(architecture_text, lessons_text, lang=lang)
+                    # Spec gives the manifest builder explicit features to cover.
+                    if spec_block:
+                        manifest_prompt += "\n\n" + spec_block
                     msgs = _build_messages(manifest_prompt, task)
                     msg = chat(cfg, msgs, tools=[], emit=emit)
 
@@ -3993,9 +4072,232 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             if line.strip():
                                 emit("log", msg=f"  [adv-residual] {line[:200]}")
                         # Fall through to the success-path break below.
+
+                    # ── Completeness critic (once per build) ──
+                    # Validation green only proves what was built works. The
+                    # critic answers "did we build what was specified?". Runs
+                    # once; if missing-feature findings come back high or
+                    # medium severity, bounce to BUILD with the gap list as
+                    # the instruction. The completeness_critic_done flag and
+                    # the underlying validate_retries cap together prevent
+                    # an unproductive critic from looping the build.
+                    if (not state.completeness_critic_done
+                            and not spec.is_empty()
+                            and not adv_failures_to_inject):
+                        state.completeness_critic_done = True
+                        try:
+                            from .critic import (
+                                audit_completeness,
+                                completeness_score,
+                                format_for_iterate,
+                            )
+                            missing = audit_completeness(
+                                spec, workspace, manifest.to_detailed(),
+                                lang, cfg, emit=emit,
+                            )
+                            score = completeness_score(spec, missing)
+                            emit("log", msg=(
+                                f"[CRITIC] completeness score = {score:.2f}; "
+                                f"{len(missing)} missing feature(s)"
+                            ))
+                            actionable = [m for m in missing
+                                          if m.severity in ("high", "medium")]
+                            if actionable:
+                                instr = format_for_iterate(actionable)
+                                emit("log", msg=(
+                                    f"[CRITIC] {len(actionable)} actionable "
+                                    "gap(s); bouncing to BUILD for a "
+                                    "completion pass"
+                                ))
+                                for m in actionable[:5]:
+                                    emit("log", msg=(
+                                        f"  [crit] {m.story_id} "
+                                        f"[{m.priority}] {m.title}"
+                                    ))
+                                if state.retreat_to_build():
+                                    executor.grant_rewrites(
+                                        max(len(manifest.files), 5))
+                                    code_map = _get_code_map()
+                                    build_prompt = build_build_prompt(
+                                        entry_point=entry_point,
+                                        manifest_summary=manifest.to_detailed(),
+                                        progress_context=progress.to_context(),
+                                        validation_failures="",
+                                        lessons_text=lessons_text,
+                                        code_map=code_map,
+                                        lang=lang,
+                                    )
+                                    if spec_block:
+                                        build_prompt += "\n\n" + spec_block
+                                    messages = _build_messages(
+                                        build_prompt, task)
+                                    messages.append({
+                                        "role": "user",
+                                        "content": instr,
+                                    })
+                                    no_tool_rounds = 0
+                                    progress.log(
+                                        f"Critic: {len(actionable)} gaps; "
+                                        "retreating to BUILD"
+                                    )
+                                    continue
+                                emit("log", msg=(
+                                    "[CRITIC] retreat blocked — validate "
+                                    "retries exhausted; logging as advisory"
+                                ))
+                            else:
+                                emit("log", msg="[CRITIC] no actionable gaps")
+                        except Exception as _e:
+                            emit("log", msg=f"[CRITIC] crashed (advisory): {_e}")
+
+                    # ── Runtime verification (once per build) ──
+                    # CRITIC verifies "did we build it?". Runtime verification
+                    # answers "does it actually work?". For HTTP backends, boots
+                    # the server and drives spec flows with real captures and
+                    # assertions; for CLIs runs scripted argv probes; for
+                    # libraries imports and asserts. On gaps, retreat to BUILD
+                    # once with the failure list as the instruction.
+                    if (not state.runtime_verify_done
+                            and not spec.is_empty()
+                            and not adv_failures_to_inject):
+                        state.runtime_verify_done = True
+                        try:
+                            from .runtime import runtime_verify, format_for_iterate as _rt_fmt
+                            contract_obj = None
+                            try:
+                                from .contracts import Contract
+                                contract_obj = Contract.load(workspace)
+                            except Exception:
+                                contract_obj = None
+                            rt_result = runtime_verify(
+                                spec, workspace, lang, cfg,
+                                contract=contract_obj, emit=emit,
+                            )
+                            emit("log", msg=(
+                                f"[RUNTIME] strategy={rt_result.strategy} "
+                                f"probes_run={rt_result.probes_run} "
+                                f"failures={len(rt_result.failures)}"
+                            ))
+                            actionable_rt = list(rt_result.actionable_failures)
+                            if actionable_rt:
+                                instr = _rt_fmt(actionable_rt)
+                                emit("log", msg=(
+                                    f"[RUNTIME] {len(actionable_rt)} actionable "
+                                    "probe failure(s); bouncing to BUILD"
+                                ))
+                                for f in actionable_rt[:5]:
+                                    emit("log", msg=(
+                                        f"  [rt] {f.probe.story_id} "
+                                        f"[{f.probe.priority}] {f.failure_kind} "
+                                        f"— {f.detail[:200]}"
+                                    ))
+                                if state.retreat_to_build():
+                                    executor.grant_rewrites(
+                                        max(len(manifest.files), 5))
+                                    code_map = _get_code_map()
+                                    build_prompt = build_build_prompt(
+                                        entry_point=entry_point,
+                                        manifest_summary=manifest.to_detailed(),
+                                        progress_context=progress.to_context(),
+                                        validation_failures="",
+                                        lessons_text=lessons_text,
+                                        code_map=code_map,
+                                        lang=lang,
+                                    )
+                                    if spec_block:
+                                        build_prompt += "\n\n" + spec_block
+                                    messages = _build_messages(
+                                        build_prompt, task)
+                                    messages.append({
+                                        "role": "user",
+                                        "content": instr,
+                                    })
+                                    no_tool_rounds = 0
+                                    progress.log(
+                                        f"Runtime: {len(actionable_rt)} "
+                                        "probe failure(s); retreating to BUILD"
+                                    )
+                                    continue
+                                emit("log", msg=(
+                                    "[RUNTIME] retreat blocked — validate "
+                                    "retries exhausted; logging as advisory"
+                                ))
+                            elif rt_result.failures:
+                                # Only "could"-priority failures remain.
+                                emit("log", msg=(
+                                    f"[RUNTIME] {len(rt_result.failures)} "
+                                    "could-priority gap(s) — advisory only"
+                                ))
+                        except Exception as _e:
+                            emit("log", msg=f"[RUNTIME] crashed (advisory): {_e}")
+
                     progress.log("Validation passed" + (
                         f" ({len(warnings_list)} warning(s))" if warnings_list else ""
                     ))
+
+                    # ── Progressive tier advance ──
+                    # Tier 1 (must) just went green. If there are more tiers,
+                    # widen the spec_block, reset per-tier flags, and bounce
+                    # back into BUILD to layer should/could stories onto the
+                    # green tier-1 base. If this was the last tier, fall
+                    # through to COMPLETE.
+                    if _tiers and _tier_index + 1 < len(_tiers):
+                        _tier_index += 1
+                        current_tier_name, current_tier_spec = _tiers[_tier_index]
+                        spec_block = current_tier_spec.to_prompt_block()
+                        state.current_tier = current_tier_name
+                        # Reset per-tier flags so CRITIC + RUNTIME re-evaluate
+                        # the wider story set, and so stuck-loop detection
+                        # starts fresh on the new surface.
+                        state.completeness_critic_done = False
+                        state.runtime_verify_done = False
+                        state.stuck_fingerprints = []
+                        state.surgical_fixes_attempted = set()
+                        state.validate_retries = 0
+                        state.adversarial_retries = 0
+                        emit("log", msg=(
+                            f"[TIER] advancing to tier {_tier_index + 1}/{len(_tiers)}: "
+                            f"{current_tier_name} ({len(current_tier_spec.stories)} stories)"
+                        ))
+                        # Bounce back into BUILD with the wider spec.
+                        if state.retreat_to_build():
+                            executor.grant_rewrites(max(len(manifest.files), 5))
+                            code_map = _get_code_map()
+                            build_prompt = build_build_prompt(
+                                entry_point=entry_point,
+                                manifest_summary=manifest.to_detailed(),
+                                progress_context=progress.to_context(),
+                                validation_failures="",
+                                lessons_text=lessons_text,
+                                code_map=code_map,
+                                lang=lang,
+                            )
+                            if spec_block:
+                                build_prompt += "\n\n" + spec_block
+                            messages = _build_messages(build_prompt, task)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"Tier {_tier_index + 1} ({current_tier_name}): "
+                                    f"the previous tier is green. Now extend the "
+                                    "implementation to cover the newly-added stories "
+                                    "in the spec block above. Don't regress the "
+                                    "tier-1 functionality."
+                                ),
+                            })
+                            no_tool_rounds = 0
+                            progress.log(
+                                f"Tier {_tier_index + 1} ({current_tier_name}) start"
+                            )
+                            continue
+                        # retreat_to_build returned False (retries exhausted).
+                        # Ship tier 1 result and log the gap.
+                        emit("log", msg=(
+                            f"[TIER] tier {_tier_index} green but cannot enter "
+                            f"tier {_tier_index + 1} — validate budget exhausted; "
+                            "shipping current state."
+                        ))
+
                     progress.phase = "COMPLETE"
                     if "VALIDATE" not in reflection_run_for_phase:
                         _run_phase_reflection(
@@ -4008,6 +4310,53 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                     last_failures_summary = failures_text[:1500]
                     emit("log", msg=f"[Validation failed, retry {state.validate_retries + 1}/{state.max_validate_retries}]")
                     progress.log(f"Validation failed: {failures_text[:100]}")
+
+                    # ── Stuck-loop detection ──
+                    # When the same error fingerprint appears in 3 consecutive
+                    # retries the LLM is in an unproductive loop — same input,
+                    # same wrong output. Switch strategy: targeted single-file
+                    # surgical edit. See cadillac.surgical for the mechanism.
+                    try:
+                        from .surgical import parse_static_errors, surgical_fix
+                        retry_errors = parse_static_errors(results)
+                        retry_fps = frozenset(e.fingerprint for e in retry_errors)
+                        state.stuck_fingerprints.append(retry_fps)
+                        state.stuck_fingerprints = state.stuck_fingerprints[-5:]
+                        if len(state.stuck_fingerprints) >= 3:
+                            recent3 = state.stuck_fingerprints[-3:]
+                            stuck_fps = set.intersection(*[set(s) for s in recent3])
+                            stuck_fps -= state.surgical_fixes_attempted
+                            if stuck_fps:
+                                for fp in sorted(stuck_fps):
+                                    state.surgical_fixes_attempted.add(fp)
+                                    target = next((e for e in retry_errors
+                                                    if e.fingerprint == fp), None)
+                                    if target is None:
+                                        continue
+                                    emit("log", msg=f"[STUCK] {fp} repeated 3x — entering surgical mode")
+                                    cleared = surgical_fix(target, workspace, lang, cfg, emit)
+                                    if cleared:
+                                        # Re-run full validation; if green, jump
+                                        # to the success path next loop iteration.
+                                        results = run_validation(
+                                            workspace, entry_point,
+                                            expected_packages=modular_plan.dependencies if modular_plan else None,
+                                            lang=lang,
+                                        )
+                                        progress.validation = results_to_dict(results)
+                                        failures_text = format_failures(results)
+                                        if not failures_text:
+                                            emit("log", msg="[STUCK/CLEARED] validation now green")
+                                            # Pop back into the VALIDATE phase
+                                            # with cleared results — let the
+                                            # success-side block of THIS retry
+                                            # run next iteration of the phase
+                                            # loop. Force re-entry by NOT
+                                            # retreating to BUILD here.
+                                            continue
+                    except Exception as _e:
+                        emit("log", msg=f"[STUCK] detector crashed (advisory): {_e}")
+
                     if state.retreat_to_build():
                         # Auto-install missing npm deps before retrying
                         installed = _auto_install_missing_deps(workspace, failures_text, lang, emit)
@@ -4049,6 +4398,7 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
     except EndpointUnreachable as e:
         emit("error", msg=f"[ABORT endpoint_down] {e}")
         progress.log(f"ABORT: endpoint unreachable — {e}")
+        _interrupted_for_reraise = None  # not a signal; outer build() decides
     except KeyboardInterrupt as e:
         # SIGTERM or Ctrl+C: we want to salvage whatever rounds were spent so
         # the next build's memory-aware budgets see this partial run. The

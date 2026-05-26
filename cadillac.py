@@ -246,6 +246,8 @@ Examples:
                         help="Max chat completions per second — protects the vLLM server from stampede. Default 0.25 (≈ one call every 4s). Pass 0 to disable. Env: CADILLAC_RATE_LIMIT. Only limits inference calls, not tool dispatches.")
     parser.add_argument("--stream", action="store_true", help="Stream LLM output")
     parser.add_argument("--plain", action="store_true", help="Disable Rich display (plain text output)")
+    parser.add_argument("--full-spec", action="store_true",
+                        help="Build all spec tiers (must + should + could). Default: must + should only — could-priority stories are skipped to bound build wall time.")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -344,6 +346,8 @@ Examples:
         api_key=args.api_key,
         rate_limit=args.rate,
     )
+    # Threaded into engine.run() for progressive-tier orchestration.
+    cfg.full_spec = bool(getattr(args, "full_spec", False))
 
     if args.command == "new":
         cmd_new(args, cfg)
