@@ -427,9 +427,61 @@ cadillac iterate workspace-XXXX "instruction"# extend an existing build
 cadillac resume workspace-XXXX               # resume a crashed build
 cadillac enhance ./my-project "add auth"     # modify an external codebase
 cadillac debug workspace-XXXX syntax         # focused debug pass
+cadillac improve                             # self-improvement cycle vs. test matrix
 cadillac dash                                # 📊 zero-service TUI dashboard
 cadillac list                                # show all workspaces
-cadillac                                     # interactive shell
+cadillac                                     # ↓ interactive shell ↓
+```
+
+#### Interactive shell
+
+Running `python3 -m cadillac` with no subcommand drops into a REPL — handy for chaining `new → list → open → iterate` against the same endpoint without re-typing `--api-url` each time.
+
+```
+$ cd /home/waive3/sandbox
+$ python3 -m cadillac --api-url http://192.168.86.39:8000/v1
+╭─────────────────────────────────────────╮
+│ Cadillac — Autonomous Agent Builder     │
+│ API: http://192.168.86.39:8000/v1       │
+│ Type help for commands                  │
+╰─────────────────────────────────────────╯
+cadillac>
+```
+
+Shell commands (no `cadillac` prefix needed inside the prompt):
+
+| Command | What |
+|---|---|
+| `new <task>` | Start a new build |
+| `resume <workspace>` | Resume a crashed/interrupted build |
+| `list` | List all workspaces with status summaries |
+| `open <workspace>` | Show workspace details (files, phase, validation mix) |
+| `iterate <workspace> [msg]` | Re-run BUILD→VALIDATE on an existing workspace |
+| `debug <workspace> [target]` | Focused debug pass on a specific failure |
+| `lessons` | Show accumulated lessons (top by confidence) |
+| `config [key] [value]` | Inspect or override session config |
+| `help` | Print this command list |
+| `quit` / `exit` / `q` / `Ctrl-D` | Exit the shell |
+
+Workspace names support fuzzy prefix matching — `iterate 20260526` resolves to the most-recent workspace whose name starts with `workspace-20260526`. A typical session:
+
+```
+cadillac> new Flask URL shortener with JWT auth
+[PLAN] ... [BUILD] ... [VALIDATE] All validations passed!
+
+cadillac> list
+  workspace-20260526-114502  ✓ DONE  17/17
+  workspace-20260526-101234  ● LIVE  4/12
+  ...
+
+cadillac> iterate 20260526-1145 add rate limiting on /shorten
+
+cadillac> lessons
+  [do]   When: SQLite write during async handler  → Use aiosqlite ...
+  [dont] NEVER: f-string-built SQL with user input ...
+
+cadillac> quit
+Bye!
 ```
 
 #### Flags worth knowing
