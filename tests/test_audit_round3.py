@@ -3,7 +3,10 @@
 import os
 import unittest
 
+from cadillac import engine as _engine_mod
 from cadillac.modules import ModularPlan, ModuleSpec
+
+_ENGINE_PATH = _engine_mod.__file__
 
 
 def _plan(modules: list[dict], **kw) -> dict:
@@ -73,7 +76,7 @@ class TestEngineFlatPlanClearsModularPlan(unittest.TestCase):
     """
 
     def test_engine_resets_modular_plan_on_flat_acceptance(self):
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         # Find the flat-plan handling block — it has the "[Manifest:" log
         # and the comment "# Standard flat plan"
@@ -90,7 +93,7 @@ class TestEngineHardStopsOnRepeatedManifestFailure(unittest.TestCase):
     the PLAN loop must surface a clean abort instead of looping forever."""
 
     def test_engine_has_hard_stop_termination(self):
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         # Counter must exist
         self.assertIn("flat_manifest_failures", src,

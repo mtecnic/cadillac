@@ -6,7 +6,10 @@ and silent failure-passes when retries exhaust.
 
 import unittest
 
+from cadillac import engine as _engine_mod
 from cadillac.phases import Phase, PhaseState
+
+_ENGINE_PATH = _engine_mod.__file__
 
 
 class TestPhaseStateAdvanceRecordsRounds(unittest.TestCase):
@@ -78,7 +81,7 @@ class TestAdversarialBlockMessageContent(unittest.TestCase):
         """The audit fix added 'residual' tags to the WIRING-exhausted
         and adversarial-blocked paths. Pin them so a future regression
         that strips them will fail this test."""
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         # WIRING residual error logging
         self.assertIn("wiring/error-residual", src,
@@ -94,7 +97,7 @@ class TestAdversarialBlockMessageContent(unittest.TestCase):
         """H4 lock-in: the post-fix code MUST call state.advance() and not
         set state.current directly. Find the WIRING-exhausted path and
         check its body."""
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         # The exhausted block has the marker comment "(H4, M4)" added in the fix.
         # Just before the body's continue/break, we expect state.advance()
