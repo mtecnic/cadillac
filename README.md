@@ -18,7 +18,7 @@
 ![Tests](https://img.shields.io/badge/tests-616%20passing-2ea44f?style=flat-square)
 ![Builds](https://img.shields.io/badge/applications%20built-146-blue?style=flat-square)
 ![Lessons](https://img.shields.io/badge/lessons%20learned-403-purple?style=flat-square)
-![License](https://img.shields.io/badge/license-private-red?style=flat-square)
+![License](https://img.shields.io/badge/license-Apache_2.0-2ea44f?style=flat-square)
 
 </div>
 
@@ -42,6 +42,22 @@ $ python3 -m cadillac --api-url $LLM_URL --plain auto \
 ```
 
 That's a real run transcript. **No human edits.** Cadillac plans the architecture, installs dependencies, writes every file, runs the tests, debugs the failures, and ships.
+
+---
+
+## 🎯 What's different
+
+Most autonomous coding agents stop when the code compiles and the unit tests pass. Cadillac doesn't, because that's where the real failure modes start.
+
+- 🩺 **Operational gates** — boots the backend with a required env var stripped and expects fail-fast; sends SIGTERM and expects clean 5s shutdown; AST-scans `INSERT INTO ... VALUES (?, None)` against `NOT NULL` columns *before* anyone deploys it. The build doesn't ship until these pass.
+- 🔍 **Completeness CRITIC** — after VALIDATE goes green, an LLM second-opinion compares the running code against an explicit spec (15-40 user stories the SPEC phase extracted from the one-sentence prompt). Missing features bounce back to BUILD with a focused instruction.
+- 🌐 **Runtime flow verification** — boots the artifact and drives real user flows (HTTP for backends, scripted argv for CLIs, runnable snippets for libraries — dispatched by language family). Catches "logout returns 200 but the token still works" — the bug class that's invisible to unit tests + lint + adversarial probes.
+- 🩹 **Surgical mode for stuck loops** — when the same validation error repeats 3 retries in a row, the harness switches strategy: a single-file focused edit with ~500 tokens of context (vs the usual 30K), augmented for `undefined name` errors with workspace-wide grep for the missing symbol's definitions. Capped at one attempt per fingerprint.
+- 🪜 **Progressive tiers** — long specs build in waves: must-stories green first, then must+should layered on top. A 30-story build that fails on a hard should-story still ships the must tier instead of losing everything.
+
+All of this composes with the rest of the pipeline: SPEC → PLAN → DEPS → SCAFFOLD → REVIEW → BUILD → INTEGRATE → WIRING → VALIDATE → CRITIC → RUNTIME → PACKAGE, wrapped in the tier loop, with memory that accumulates across runs and recall that's tag-filtered + source-task-decayed so lessons from a Rust CLI don't pollute a Flask build.
+
+The thing this isn't: an in-IDE pair programmer. The thing it is: a harness that takes a sentence and produces a packaged, validated, behaviorally-tested application *unattended*.
 
 ---
 
