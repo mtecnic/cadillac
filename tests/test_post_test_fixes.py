@@ -1842,7 +1842,8 @@ class TestContextAuto(unittest.TestCase):
             def read(self): return self.p
         payload = json.dumps({"data": [{"max_model_len": 131112}]}).encode()
         with mock.patch("urllib.request.urlopen", return_value=FakeResp(payload)):
-            got = cad._detect_context_window("http://192.168.86.42:8000/v1")
+            # 192.0.2.x is TEST-NET-1 (RFC 5737), reserved for docs/examples
+            got = cad._detect_context_window("http://192.0.2.42:8000/v1")
         self.assertEqual(got, 131112)
 
     def test_detect_context_window_network_failure(self):

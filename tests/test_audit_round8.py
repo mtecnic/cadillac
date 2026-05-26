@@ -6,6 +6,10 @@ that wouldn't show up in a lighter behavioral test.
 
 import unittest
 
+from cadillac import engine as _engine_mod
+
+_ENGINE_PATH = _engine_mod.__file__
+
 
 class TestRustTestLayoutGuidance(unittest.TestCase):
     """Limit-test 1 (TomlDiff) finding: LLM scaffolded nested
@@ -44,7 +48,7 @@ class TestBrowserExtensionPluginPin(unittest.TestCase):
     def test_engine_scaffold_pins_crxjs(self):
         """When language is browser_extension, engine.py's package.json
         scaffolding must include @crxjs/vite-plugin pinned to ^2."""
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         idx = src.find('lang.name == "browser_extension"')
         self.assertGreater(idx, 0,
@@ -65,7 +69,7 @@ class TestMultiLanguageNpmInstall(unittest.TestCase):
     Engine should detect this case and run the install."""
 
     def test_engine_runs_npm_install_in_frontend_subdir(self):
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         # Locate the multi-language sweep block
         idx = src.find("Multi-language sweep")
@@ -86,7 +90,7 @@ class TestMultiLanguageNpmInstall(unittest.TestCase):
     def test_engine_skips_when_node_modules_already_present(self):
         """The sweep should be a no-op when node_modules already exists,
         so we don't reinstall on every iterate/build cycle."""
-        with open("/home/waive3/sandbox/cadillac/engine.py") as f:
+        with open(_ENGINE_PATH) as f:
             src = f.read()
         idx = src.find("Multi-language sweep")
         block = src[idx:idx + 1500]

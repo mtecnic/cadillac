@@ -447,7 +447,7 @@ cadillac/
 ## ⚡ Quick start
 
 ```bash
-cd /home/waive3/sandbox
+cd ~/sandbox
 
 python3 -m cadillac --api-url http://<your-llm>/v1 --plain auto "your task here"
 ```
@@ -474,11 +474,11 @@ cadillac                                     # ↓ interactive shell ↓
 Running `python3 -m cadillac` with no subcommand drops into a REPL — handy for chaining `new → list → open → iterate` against the same endpoint without re-typing `--api-url` each time.
 
 ```
-$ cd /home/waive3/sandbox
-$ python3 -m cadillac --api-url http://192.168.86.39:8000/v1
+$ cd ~/sandbox
+$ python3 -m cadillac --api-url http://<your-llm>:8000/v1
 ╭─────────────────────────────────────────╮
 │ Cadillac — Autonomous Agent Builder     │
-│ API: http://192.168.86.39:8000/v1       │
+│ API: http://<your-llm>:8000/v1          │
 │ Type help for commands                  │
 ╰─────────────────────────────────────────╯
 cadillac>
@@ -647,7 +647,7 @@ Each module gets a `ModuleScopedExecutor` allowed to `write_file`, `edit_file`, 
 
 - 🤖 **The LLM has to be smart enough.** Hard test mocks, TypeScript union narrowing, async timing, and React testing-library queries with multiple matchers can stump weaker models. Cadillac gives the LLM every tool it needs (memory, scratch, code map, error logs, stuck-pattern detection) but can't substitute for reasoning.
 - ⚙️ **Node execution of `.tsx` entry points** — for React projects, the `run` check uses `vite build` correctly, but the fallback `node entry --test` path can hit `ERR_UNKNOWN_FILE_EXTENSION` on `.tsx`. Surfaces occasionally when language state mutates mid-build.
-- 🖥️ **Headless only.** The `waive3` dev machine is headless, so pygame/GUI apps get built and tested (with `SDL_VIDEODRIVER=dummy`) but never visually verified.
+- 🖥️ **Headless only.** Pygame/GUI apps get built and tested (with `SDL_VIDEODRIVER=dummy`) but never visually verified — the primary dev machine is headless.
 - 🔌 **Single backend per invocation.** Fleet/multi-model routing isn't built in.
 
 ---
