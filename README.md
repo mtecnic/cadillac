@@ -613,65 +613,36 @@ Found and reported behavioral gaps that unit tests + adversarial + WIRING all mi
 
 ## 📦 26 apps shipped by Cadillac — public, runnable, honest
 
-Every app in this list was built by Cadillac with **zero human edits to the code**.
-Each repo has its own README that lists exactly which validation checks passed and which didn't.
+A separate repo, [**`mtecnic/cadillac-builds`**](https://github.com/mtecnic/cadillac-builds), is the gallery: **26 applications built unattended by Cadillac with zero human edits to the code**, organized by category. Each project has its own README that lists exactly which validation checks passed and which didn't.
 
-This is not a curated showcase — it's the result of scanning ~99 build workspaces from the past 8 weeks
-and publishing every one that's actually finished and runnable. 26 made the cut; the other 73 were
-mid-scaffold failures, duplicate task attempts, or had broken entry points (full skip list in the
-publication notes).
+```
+cadillac-builds/
+├── games/   # 7 projects — matrix-doom-fps, pygame-snake,
+│             #              ascii-pong-curses, midnight-library-escape,
+│             #              llm-token-stream-visualizer, gpu-cluster-dashboard,
+│             #              aurora-ascii-art
+├── web/     # 10 projects — auction-house-marketplace (Flask+SQLite, 63 files),
+│             #               flask-habit-tracker, flask-crm,
+│             #               flask-todo-blueprints, pawperfect-react,
+│             #               multi-room-chat-server, book-library-api,
+│             #               dungeon-master-api, url-shortener-ts,
+│             #               tasks-rest-api-ts
+├── cli/     # 8 projects — expense-tracker-cli, taskmgr-python,
+│             #              click-calc-cli, aiosqlite-bookmark-manager,
+│             #              log-analyzer-stdlib, csvstats-cli, cipher-forge,
+│             #              oracle-of-winds
+└── ml/      # 1 project  — imageclassifier-cnn (PyTorch CNN + CLI)
+```
 
-### Games & visualization
+This isn't a curated showcase. It's the result of scanning ~99 build workspaces from the past 8 weeks and publishing every one that's actually finished and runnable. 26 made the cut; the other 73 were mid-scaffold failures, duplicate task attempts, or had broken entry points — the gallery README is honest about that ratio.
 
-| Project | Stack | What it does |
-|---|---|---|
-| [matrix-doom-fps](https://github.com/mtecnic/matrix-doom-fps) | Python + pygame | Matrix-themed ASCII Doom raycaster — 31 files, all checks PASS |
-| [pygame-snake](https://github.com/mtecnic/pygame-snake) | Python + pygame | Classic Snake with pure-logic pytest tests, all checks PASS |
-| [ascii-pong-curses](https://github.com/mtecnic/ascii-pong-curses) | Python (stdlib) | Two-player curses Pong with headless `--test` mode |
-| [midnight-library-escape](https://github.com/mtecnic/midnight-library-escape) | Python | Text-adventure escape room with 5 puzzle rooms |
-| [llm-token-stream-visualizer](https://github.com/mtecnic/llm-token-stream-visualizer) | Python + pygame | vLLM token stream as glowing particles on a neural-net graph |
-| [gpu-cluster-dashboard](https://github.com/mtecnic/gpu-cluster-dashboard) | Python + pygame | Cyberpunk pygame dashboard polling `nvidia-smi` + `/proc` |
-| [aurora-ascii-art](https://github.com/mtecnic/aurora-ascii-art) | Python (stdlib) | Zero-dependency CLI rendering animated ASCII/Unicode art |
+**What this proves**:
 
-### Web apps & APIs
+- Cadillac's pipeline produces code that runs unattended on the kind of varied stack a developer would encounter day-to-day
+- Roughly 1 in 4 build attempts ships cleanly — that's the success rate against the current workspace backlog. Resilience layers (operational gates, completeness CRITIC, runtime flow verification, surgical mode, progressive tiers) close more failure modes each version
+- Every project's README documents its validation gaps honestly. Nothing is dressed up
 
-| Project | Stack | What it does |
-|---|---|---|
-| [auction-house-marketplace](https://github.com/mtecnic/auction-house-marketplace) | Flask + SQLite | eBay-style auction marketplace, 63 files, all 10 checks PASS |
-| [flask-habit-tracker](https://github.com/mtecnic/flask-habit-tracker) | Flask + SQLite | Habit tracker with auth, streaks, search — all 12 checks PASS |
-| [flask-crm](https://github.com/mtecnic/flask-crm) | Flask + SQLite + vanilla JS | Full-stack CRM with a Kanban frontend |
-| [flask-todo-blueprints](https://github.com/mtecnic/flask-todo-blueprints) | Flask + SQLite | Flask todo API w/ blueprints, all checks PASS |
-| [pawperfect-react](https://github.com/mtecnic/pawperfect-react) | React + Vite + TS | Marketing site for a (fictional) pet grooming business |
-| [multi-room-chat-server](https://github.com/mtecnic/multi-room-chat-server) | Python + Flask | TCP chat server + Flask admin REST API, all checks PASS |
-| [book-library-api](https://github.com/mtecnic/book-library-api) | TS + Express + zod | Book library REST API with input validation |
-| [dungeon-master-api](https://github.com/mtecnic/dungeon-master-api) | TS + Express | Text dungeon-crawl REST API |
-| [url-shortener-ts](https://github.com/mtecnic/url-shortener-ts) | TS + Express | URL shortener w/ rate limiting + click stats |
-| [tasks-rest-api-ts](https://github.com/mtecnic/tasks-rest-api-ts) | TS + Express | Tasks REST API w/ filter/sort/pagination, all checks PASS |
-
-### CLI tools
-
-| Project | Stack | What it does |
-|---|---|---|
-| [expense-tracker-cli](https://github.com/mtecnic/expense-tracker-cli) | Python + SQLite | CLI with recurring transactions, budgets, CSV import |
-| [taskmgr-python](https://github.com/mtecnic/taskmgr-python) | Python + argparse | Todo CLI with JSON storage, all checks PASS |
-| [click-calc-cli](https://github.com/mtecnic/click-calc-cli) | Python + Click + rich | Calculator CLI with rich-rendered output |
-| [aiosqlite-bookmark-manager](https://github.com/mtecnic/aiosqlite-bookmark-manager) | Python + Click + aiosqlite | Async-SQLite bookmark manager |
-| [log-analyzer-stdlib](https://github.com/mtecnic/log-analyzer-stdlib) | Python (stdlib) | Multi-format log analyzer (Apache/syslog/JSON) |
-| [csvstats-cli](https://github.com/mtecnic/csvstats-cli) | TypeScript | TS CLI for column statistics on CSV files |
-| [cipher-forge](https://github.com/mtecnic/cipher-forge) | TypeScript | Caesar/Vigenère/Atbash/Rail/Morse CLI with ornate output |
-| [oracle-of-winds](https://github.com/mtecnic/oracle-of-winds) | TypeScript | Deterministic divination CLI (runes, I-Ching, stars) |
-
-### ML
-
-| Project | Stack | What it does |
-|---|---|---|
-| [imageclassifier-cnn](https://github.com/mtecnic/imageclassifier-cnn) | Python + PyTorch | Tiny CNN with synthetic data + CLI for train/predict |
-
-### What this proves
-
-- Cadillac's pipeline produces code that runs unattended on the same kind of varied stack a developer would encounter day-to-day
-- Roughly 1 in 4 build attempts ships cleanly — that's the success rate against the current matrix. The others either fail mid-scaffold (mostly due to fixed bugs in earlier versions of the harness) or get filtered as duplicates of better runs
-- Every shipped repo's README is honest about which validation checks failed. Nothing here is dressed up
+👉 **[Browse all 26 in `cadillac-builds`](https://github.com/mtecnic/cadillac-builds)**
 
 ---
 
