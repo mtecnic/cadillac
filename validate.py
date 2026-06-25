@@ -2988,7 +2988,18 @@ def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
                     # the idiom. Skip when the only interpolated names are
                     # placeholder-string-style identifiers.
                     if pat["rule"] == "sql_fstring":
-                        line_text = text.splitlines()[line_no - 1]
+                        # The trigger regex permits whitespace (including
+                        # newlines) between `.execute(` and the f-string, so
+                        # the line where the match STARTS may not contain
+                        # the f-string itself (it may sit on the next line).
+                        # Inspect the lines covered by the match span plus a
+                        # small lookahead so we see the actual f-string body.
+                        match_end_line = text[:m.end()].count("\n") + 1
+                        end_line = min(len(text.splitlines()),
+                                       match_end_line + 1)
+                        line_text = "\n".join(
+                            text.splitlines()[line_no - 1:end_line]
+                        )
                         # (1) `execute(f"PRAGMA name=value")` — PRAGMA can't be
                         #     parameterized in SQLite; the f-string is the
                         #     only way to set per-connection flags. Values
@@ -3026,6 +3037,26 @@ def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
                             n in safe_names for n in interpolated
                         ):
                             continue
+                        # (3) Schema-identifier constants — variables that
+                        #     are ALL_CAPS or end with _TABLE / _COL / _COLUMN
+                        #     are conventionally module-level identifier
+                        #     constants (table names, column names), not
+                        #     user input. The query's value-position is
+                        #     still parameterized with `?`. This pattern
+                        #     showed up in real builds as
+                        #         f"INSERT INTO {USERS_TABLE} ({U_EMAIL}) VALUES (?)"
+                        #     where USERS_TABLE and U_EMAIL are module
+                        #     constants. Only skip when ALL interpolations
+                        #     match this shape AND a `?` parameter exists
+                        #     in the same statement.
+                        if interpolated and "?" in line_text:
+                            looks_like_const = lambda n: (
+                                n.isupper()
+                                or n.endswith(("_TABLE", "_COL", "_COLUMN",
+                                                "_FIELD", "_NAME"))
+                            )
+                            if all(looks_like_const(n) for n in interpolated):
+                                continue
                     # De-dup: don't fire the same rule on the same line twice.
                     if any(
                         f.rule == pat["rule"] and f.file == rel and f.line == line_no
