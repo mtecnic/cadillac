@@ -98,6 +98,51 @@ class TestSqlInjection(unittest.TestCase):
             errors, _ = _findings(td)
             self.assertEqual(errors, [])
 
+    def test_schema_identifier_constants_not_flagged(self):
+        """Real false positive from the 2026-06-25 habit-tracker build:
+        f"INSERT INTO {USERS_TABLE} ({U_EMAIL}) VALUES (?)" was flagged
+        18× even though the only interpolations are module-level
+        identifier constants and the value position uses `?` parameters.
+
+        Constants are uppercase or have a known suffix (_TABLE, _COL, etc).
+        The execute call spans multiple lines so the FP guard has to
+        look at the lines covered by the regex match, not just the
+        line where the match started.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "repo.py",
+                   'USERS_TABLE = "users"\n'
+                   'U_EMAIL = "email"\n'
+                   'U_PW = "password_hash"\n'
+                   'async def create(conn, email, pw):\n'
+                   '    cursor = await conn.execute(\n'
+                   '        f"INSERT INTO {USERS_TABLE} ({U_EMAIL}, {U_PW}) VALUES (?, ?)",\n'
+                   '        (email, pw),\n'
+                   '    )\n')
+            errors, _ = _findings(td)
+            self.assertFalse(
+                any("sql_fstring" in e.output for e in errors),
+                f"schema-identifier-constant pattern must not be flagged; got: {errors}",
+            )
+
+    def test_schema_identifier_pattern_requires_question_mark(self):
+        """The schema-constant guard ONLY fires when `?` parameters are
+        present in the same statement. A naked f-string with NO `?` and
+        only constants is still suspicious (the values must be coming
+        from somewhere) — keep flagging it."""
+        with tempfile.TemporaryDirectory() as td:
+            # No `?` placeholder — the constants are the only interpolation
+            # but there's no parameterized value position. Stays flagged.
+            _write(td, "repo.py",
+                   'TABLE = "users"\n'
+                   'def get():\n'
+                   '    return conn.execute(f"SELECT * FROM {TABLE}")\n')
+            errors, _ = _findings(td)
+            self.assertTrue(
+                any("sql_fstring" in e.output for e in errors),
+                "no `?` means we can't prove values are parameterized; must flag",
+            )
+
 
 class TestCommandInjection(unittest.TestCase):
     def test_shell_true_with_fstring(self):
