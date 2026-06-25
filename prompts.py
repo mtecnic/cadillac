@@ -248,11 +248,13 @@ it cascades to every test downstream and hides the actual signal. Each test file
 subsystem (plus shared types) and asserts behavior in isolation. The --test flag's implementation should \
 invoke `pytest.main(["-x", "--tb=short", "-q"])` programmatically, not re-implement assertions inline.
 
+{lessons}
+
+{spec_block}
+
 {manifest_summary}
 
-{progress_context}
-
-{lessons}"""
+{progress_context}"""
 
 
 # ── BUILD ─────────────────────────────────────────────────────────────────────
@@ -304,15 +306,17 @@ RULES:
 - package.json / tsconfig.json / *.config.* are protected — use add_dep(name, version, dev) to add deps.
 - IMPORT DISCIPLINE: every symbol you reference (class, function, type) MUST be imported at the top of the SAME module that uses it. Do NOT rely on package-level __init__.py re-exports — sibling modules don't inherit each other's namespaces. If you reference `curses.KEY_LEFT`, the file using it needs `import curses`. If a function uses `Optional`, that file needs `from typing import Optional`.
 
+{lessons}
+
+{spec_block}
+
 {manifest_summary}
+
+{code_map}
 
 {progress_context}
 
-{validation_failures}
-
-{lessons}
-
-{code_map}"""
+{validation_failures}"""
 
 
 # ── MODULAR PROMPTS ──────────────────────────────────────────────────────
@@ -785,12 +789,25 @@ RULES:
 
 # ── Prompt builders ───────────────────────────────────────────────────────────
 
-def build_architecture_prompt(lessons_text: str = "", lang=None) -> str:
+def _append_spec_block(body: str, spec_block: str) -> str:
+    """Attach the user-story spec at a stable position relative to the template.
+
+    Centralized so every builder uses the exact same separator + placement —
+    vLLM's prefix cache depends on the prefix being byte-identical across
+    rounds, and a stray whitespace difference here would invalidate the
+    cache for every subsequent round.
+    """
+    return body + "\n\n" + spec_block if spec_block else body
+
+
+def build_architecture_prompt(lessons_text: str = "", spec_block: str = "", lang=None) -> str:
     q = _quality_block(lang)
-    return _ARCHITECTURE_TEMPLATE.format(lessons=lessons_text, **q)
+    body = _ARCHITECTURE_TEMPLATE.format(lessons=lessons_text, **q)
+    return _append_spec_block(body, spec_block)
 
 
-def build_manifest_prompt(architecture: str, lessons_text: str = "", lang=None) -> str:
+def build_manifest_prompt(architecture: str, lessons_text: str = "",
+                          spec_block: str = "", lang=None) -> str:
     q = _quality_block(lang)
     # Derive test file example from language conventions
     if lang and lang.family == "node":
@@ -799,13 +816,14 @@ def build_manifest_prompt(architecture: str, lessons_text: str = "", lang=None) 
     else:
         test_file_example = "test_server.py"
         integration_test_file = "test_integration.py"
-    return _MANIFEST_TEMPLATE.format(
+    body = _MANIFEST_TEMPLATE.format(
         architecture=architecture,
         lessons=lessons_text,
         test_file_example=test_file_example,
         integration_test_file=integration_test_file,
         **q,
     )
+    return _append_spec_block(body, spec_block)
 
 
 def build_scaffold_prompt(
@@ -813,6 +831,7 @@ def build_scaffold_prompt(
     manifest_summary: str = "",
     progress_context: str = "",
     lessons_text: str = "",
+    spec_block: str = "",
     lang=None,
 ) -> str:
     q = _quality_block(lang)
@@ -821,6 +840,7 @@ def build_scaffold_prompt(
         manifest_summary=manifest_summary,
         progress_context=progress_context,
         lessons=lessons_text,
+        spec_block=spec_block,
         **q,
     )
 
@@ -832,9 +852,14 @@ def build_build_prompt(
     validation_failures: str = "",
     lessons_text: str = "",
     code_map: str = "",
+    spec_block: str = "",
     lang=None,
 ) -> str:
     q = _quality_block(lang)
+    # spec_block is rendered inline at a stable position (between lessons and
+    # manifest_summary), NOT appended at the tail. Tail-appended content sits
+    # AFTER the volatile fields and so picks up cache invalidation on every
+    # round; rendering it inline puts it inside the long stable prefix.
     return _BUILD_TEMPLATE.format(
         entry_point=entry_point,
         manifest_summary=manifest_summary,
@@ -842,6 +867,7 @@ def build_build_prompt(
         validation_failures=validation_failures,
         lessons=lessons_text,
         code_map=code_map,
+        spec_block=spec_block,
         **q,
     )
 
@@ -861,7 +887,8 @@ def build_package_prompt(manifest_summary: str = "", lang=None) -> str:
 
 # ── Modular prompt builders ──────────────────────────────────────────────
 
-def build_modular_architecture_prompt(lessons_text: str = "", lang=None) -> str:
+def build_modular_architecture_prompt(lessons_text: str = "", spec_block: str = "",
+                                       lang=None) -> str:
     q = _quality_block(lang)
     if lang and lang.family == "node":
         test_file_example = "core.test.ts"
@@ -869,15 +896,17 @@ def build_modular_architecture_prompt(lessons_text: str = "", lang=None) -> str:
     else:
         test_file_example = "test_auth.py"
         integration_test_file = "test_integration.py"
-    return _MODULAR_ARCHITECTURE_TEMPLATE.format(
+    body = _MODULAR_ARCHITECTURE_TEMPLATE.format(
         lessons=lessons_text,
         test_file_example=test_file_example,
         integration_test_file=integration_test_file,
         **q,
     )
+    return _append_spec_block(body, spec_block)
 
 
-def build_modular_manifest_prompt(architecture: str, lessons_text: str = "", lang=None) -> str:
+def build_modular_manifest_prompt(architecture: str, lessons_text: str = "",
+                                   spec_block: str = "", lang=None) -> str:
     q = _quality_block(lang)
     if lang and lang.family == "node":
         test_file_example = "core.test.ts"
@@ -885,13 +914,14 @@ def build_modular_manifest_prompt(architecture: str, lessons_text: str = "", lan
     else:
         test_file_example = "test_core.py"
         integration_test_file = "test_integration.py"
-    return _MODULAR_MANIFEST_TEMPLATE.format(
+    body = _MODULAR_MANIFEST_TEMPLATE.format(
         architecture=architecture,
         lessons=lessons_text,
         test_file_example=test_file_example,
         integration_test_file=integration_test_file,
         **q,
     )
+    return _append_spec_block(body, spec_block)
 
 
 def build_module_scaffold_prompt(

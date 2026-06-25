@@ -1082,9 +1082,15 @@ def _sanitize_messages_for_send(messages: list[dict]) -> list[dict]:
                     fixed = {**tc, "function": {**tc["function"],
                              "arguments": json.dumps({"_": "malformed args dropped"})}}
                     new_tcs.append(fixed)
-            out.append({**msg, "tool_calls": new_tcs})
+            sanitized = {**msg, "tool_calls": new_tcs}
         else:
-            out.append(msg)
+            sanitized = msg
+        # Strip our private bookkeeping fields (e.g. `_kind` used to identify
+        # the scratch user message in-place). OpenAI-spec endpoints reject
+        # unknown top-level fields on some implementations.
+        if any(k.startswith("_") for k in sanitized):
+            sanitized = {k: v for k, v in sanitized.items() if not k.startswith("_")}
+        out.append(sanitized)
     return out
 
 
@@ -1670,28 +1676,68 @@ def process_tool_calls(
 
 # ── Phase-specific message builders ───────────────────────────────────────────
 
+_SCRATCH_MARKER = "## Your Scratchpad (notes you wrote earlier this build)"
+
+
 def _build_messages(system_prompt: str, task: str, extra: list[dict] | None = None,
                     scratch_text: str = "") -> list[dict]:
+    """Build the message list, keeping scratch OUT of the system prompt.
+
+    Scratch refreshes every 3 rounds. If we merged it into the system prompt
+    every refresh would invalidate vLLM's prefix cache. Keeping it as a
+    separate user message means the cached system prefix survives each
+    refresh — only the scratch user message gets replaced.
+    """
+    msgs: list[dict] = [{"role": "system", "content": system_prompt}]
     if scratch_text and scratch_text.strip():
-        system_prompt = system_prompt + "\n\n## Your Scratchpad (notes you wrote earlier this build)\n" + scratch_text.strip()
-    msgs = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task},
-    ]
+        msgs.append({
+            "role": "user",
+            "content": f"{_SCRATCH_MARKER}\n{scratch_text.strip()}",
+            "_kind": "scratch",  # identifies the scratch message for in-place refresh
+        })
+    msgs.append({"role": "user", "content": task})
     if extra:
         msgs.extend(extra)
     return msgs
 
 
 def _refresh_scratch_in_messages(messages: list[dict], system_prompt_base: str, scratch_text: str) -> None:
-    """Rewrite the system message in-place with a fresh scratch section appended."""
+    """Refresh the scratch user message in-place; leave the system prompt untouched.
+
+    `system_prompt_base` is accepted for backward compatibility but no longer
+    rewritten — the system message stays cacheable. Locates the existing
+    scratch message by its `_kind` tag or, as a fallback, by the scratch
+    marker prefix (in case the messages list was rebuilt without our tag).
+    """
     if not messages:
         return
-    if scratch_text and scratch_text.strip():
-        new_content = system_prompt_base + "\n\n## Your Scratchpad (notes you wrote earlier this build)\n" + scratch_text.strip()
-    else:
-        new_content = system_prompt_base
-    messages[0] = {"role": "system", "content": new_content}
+    # Find existing scratch message (if any)
+    scratch_idx = -1
+    for i, m in enumerate(messages):
+        if m.get("_kind") == "scratch":
+            scratch_idx = i
+            break
+        if (m.get("role") == "user"
+                and isinstance(m.get("content"), str)
+                and m["content"].startswith(_SCRATCH_MARKER)):
+            scratch_idx = i
+            break
+
+    fresh = scratch_text.strip() if scratch_text else ""
+    if fresh:
+        new_msg = {
+            "role": "user",
+            "content": f"{_SCRATCH_MARKER}\n{fresh}",
+            "_kind": "scratch",
+        }
+        if scratch_idx >= 0:
+            messages[scratch_idx] = new_msg
+        else:
+            # Insert right after the system message and before the first non-system
+            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+            messages.insert(insert_at, new_msg)
+    elif scratch_idx >= 0:
+        messages.pop(scratch_idx)
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\\u001b\[[0-9;]*[A-Za-z]")
@@ -2846,13 +2892,14 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                     # Detect if modular architecture is needed
                     use_modular = _should_use_modular(task)
                     if use_modular:
-                        arch_prompt = build_modular_architecture_prompt(lessons_text, lang=lang)
+                        arch_prompt = build_modular_architecture_prompt(
+                            lessons_text, spec_block=spec_block, lang=lang)
                         emit("log", msg="[PLAN] Using modular architecture prompt")
                     else:
-                        arch_prompt = build_architecture_prompt(lessons_text, lang=lang)
-                    # Inject spec so the architect sees the explicit target.
-                    if spec_block:
-                        arch_prompt += "\n\n" + spec_block
+                        arch_prompt = build_architecture_prompt(
+                            lessons_text, spec_block=spec_block, lang=lang)
+                    # spec_block now flows through the builder so vLLM's prefix
+                    # cache sees a stable, byte-identical prefix across rounds.
                     if replan_hint:
                         arch_prompt += replan_hint
                         replan_hint = ""
@@ -2865,9 +2912,8 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                         # Re-check for modular after seeing architecture
                         if not use_modular and _should_use_modular(architecture_text):
                             emit("log", msg="[PLAN] Architecture suggests modular project, re-generating...")
-                            arch_prompt = build_modular_architecture_prompt(lessons_text, lang=lang)
-                            if spec_block:
-                                arch_prompt += "\n\n" + spec_block
+                            arch_prompt = build_modular_architecture_prompt(
+                                lessons_text, spec_block=spec_block, lang=lang)
                             msgs = _build_messages(arch_prompt, task)
                             msg = chat(cfg, msgs, tools=[], emit=emit)
                             architecture_text = (msg.get("content") or "").strip()
@@ -2885,7 +2931,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                     modular_fallback_to_flat = modular_manifest_failures >= 2
                     if is_modular_arch and not modular_fallback_to_flat:
                         emit("log", msg="[PLAN] Building MODULAR manifest from architecture...")
-                        manifest_prompt = build_modular_manifest_prompt(architecture_text, lessons_text, lang=lang)
+                        manifest_prompt = build_modular_manifest_prompt(
+                            architecture_text, lessons_text,
+                            spec_block=spec_block, lang=lang)
                         if modular_validation_errors:
                             error_feedback = (
                                 "\n\n## PREVIOUS ATTEMPT FAILED VALIDATION\n"
@@ -2900,10 +2948,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             emit("log", msg="[PLAN] Modular manifest failed twice, falling back to flat...")
                         else:
                             emit("log", msg="[PLAN] Building manifest from architecture...")
-                        manifest_prompt = build_manifest_prompt(architecture_text, lessons_text, lang=lang)
-                    # Spec gives the manifest builder explicit features to cover.
-                    if spec_block:
-                        manifest_prompt += "\n\n" + spec_block
+                        manifest_prompt = build_manifest_prompt(
+                            architecture_text, lessons_text,
+                            spec_block=spec_block, lang=lang)
                     msgs = _build_messages(manifest_prompt, task)
                     msg = chat(cfg, msgs, tools=[], emit=emit)
 
@@ -4125,10 +4172,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                         validation_failures="",
                                         lessons_text=lessons_text,
                                         code_map=code_map,
+                                        spec_block=spec_block,
                                         lang=lang,
                                     )
-                                    if spec_block:
-                                        build_prompt += "\n\n" + spec_block
                                     messages = _build_messages(
                                         build_prompt, task)
                                     messages.append({
@@ -4202,10 +4248,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                         validation_failures="",
                                         lessons_text=lessons_text,
                                         code_map=code_map,
+                                        spec_block=spec_block,
                                         lang=lang,
                                     )
-                                    if spec_block:
-                                        build_prompt += "\n\n" + spec_block
                                     messages = _build_messages(
                                         build_prompt, task)
                                     messages.append({
@@ -4270,10 +4315,9 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                 validation_failures="",
                                 lessons_text=lessons_text,
                                 code_map=code_map,
+                                spec_block=spec_block,
                                 lang=lang,
                             )
-                            if spec_block:
-                                build_prompt += "\n\n" + spec_block
                             messages = _build_messages(build_prompt, task)
                             messages.append({
                                 "role": "user",
