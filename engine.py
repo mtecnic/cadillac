@@ -915,6 +915,48 @@ class EndpointUnreachable(RuntimeError):
     """
 
 
+class EndpointMisconfigured(RuntimeError):
+    """Raised by chat() when the endpoint rejects every request with a
+    structural HTTP 400 — a config mismatch that NO retry will fix.
+
+    The specific case we caught in the wild: vLLM was started without
+    `--enable-auto-tool-choice --tool-call-parser <name>` flags. The
+    endpoint is alive and serves the chat-completions route, but every
+    request with `tool_choice: auto` (which Cadillac sends on every
+    chat call) returns:
+
+      HTTP 400: "auto" tool choice requires --enable-auto-tool-choice
+                and --tool-call-parser to be set
+
+    Without this guard, the build silently degrades: chat() returns an
+    empty message, the round logs "no tool calls", the phase loop
+    advances assuming the LLM declined to act, and the build burns
+    through every round budget producing zero files.
+
+    Detection rule: HTTP 400 with body text mentioning one of the known
+    config-fault signatures. Top-level run() catches this and aborts
+    cleanly with a diagnostic that names the missing flags.
+    """
+
+    def __init__(self, message: str, *, detail: str = ""):
+        super().__init__(message)
+        self.detail = detail
+
+
+# Body-text signatures that indicate a structural endpoint misconfig.
+# Match is case-insensitive substring. The HTTP 400 detection in chat()
+# treats any match here as fatal (no retry), because retrying the same
+# request shape against the same endpoint will fail identically.
+_ENDPOINT_MISCONFIG_SIGNATURES = (
+    "enable-auto-tool-choice",          # vLLM tool-call config missing
+    "tool-call-parser",                 # vLLM parser flag missing
+    "tool_choice requires",             # vLLM-style refusal message
+    "tools are not supported",          # generic
+    "function calling is not enabled",  # generic
+    "function_call is not supported",   # legacy openai-style refusal
+)
+
+
 # Per-endpoint last-send timestamp for client-side rate limiting.
 # Keyed by api_url so multiple endpoints don't throttle each other.
 _RATE_STATE: dict[str, float] = {}
@@ -1167,7 +1209,19 @@ def chat(cfg: Config, messages: list[dict], tools: list | None = None, emit=None
                 return _handle_stream(resp, t0, emit)
             if resp.status_code != 200:
                 all_conn_errors = False  # HTTP response received → endpoint alive
-                emit("error", msg=f"HTTP {resp.status_code}: {resp.text[:200]}")
+                body_text = resp.text or ""
+                emit("error", msg=f"HTTP {resp.status_code}: {body_text[:200]}")
+                # Structural endpoint misconfiguration: HTTP 400 with a body
+                # that names a known config-fault signature. No amount of
+                # retrying will fix the request shape — abort the build.
+                if resp.status_code == 400:
+                    body_lc = body_text.lower()
+                    if any(sig in body_lc for sig in _ENDPOINT_MISCONFIG_SIGNATURES):
+                        raise EndpointMisconfigured(
+                            f"endpoint at {cfg.api_url} rejected the request"
+                            f" structurally — fix the endpoint config and re-run",
+                            detail=body_text[:500],
+                        )
                 # 400 on attempt 1: try dropping the most recent assistant turn + its tool
                 # results — they may contain a poison message the server can't render.
                 if resp.status_code == 400 and attempt < 2 and len(messages) > 4:
@@ -2186,7 +2240,30 @@ def _build_module(
             break
 
     rounds_used["scaffold"] = executor.round_num
-    emit("log", msg=f"[MODULE {module_name}] Scaffold done, {len([f for f in manifest.files if f.startswith(module_path)])} files")
+    n_scaffolded = len([f for f in manifest.files if f.startswith(module_path)])
+    emit("log", msg=f"[MODULE {module_name}] Scaffold done, {n_scaffolded} files")
+
+    # Hard-fail when the scaffold loop completed without writing ANY files for
+    # this module. We caught this in the wild on a vLLM endpoint that wasn't
+    # configured for tool calling — every chat() returned empty (no tool_calls,
+    # no extractable code fences) and the loop exited via `no_tool_rounds >= 3`
+    # without an explicit error. The harness then advanced to INTEGRATE with
+    # an empty workspace and burned 1000 rounds before hitting the global cap.
+    #
+    # If the LLM legitimately couldn't write any files for a module that was
+    # PLANNED to have files, that's a hard failure for this module — surface
+    # it now so the wave/cascade logic can decide what to do (skip downstream
+    # modules, fall back to flat, abort) rather than silently advancing.
+    if n_scaffolded == 0 and mod.files:
+        err = (
+            f"Module '{module_name}' scaffold produced 0 files of "
+            f"{len(mod.files)} planned. Likely causes: LLM didn't issue any "
+            "write_file tool calls (check endpoint tool-call support), or "
+            "all writes were rejected by the scoped executor. Aborting "
+            "this module rather than running BUILD on an empty workspace."
+        )
+        emit("error", msg=f"[MODULE {module_name}] ZERO-FILE SCAFFOLD — {err}")
+        return False, [err], rounds_used
 
     # ── Post-scaffold: strip .js extensions from TS imports ──
     if lang and lang.family == "node":
@@ -4443,6 +4520,19 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
         emit("error", msg=f"[ABORT endpoint_down] {e}")
         progress.log(f"ABORT: endpoint unreachable — {e}")
         _interrupted_for_reraise = None  # not a signal; outer build() decides
+    except EndpointMisconfigured as e:
+        # No amount of retries will fix this — the endpoint's config is wrong
+        # for our request shape. Surface the specific failure so the operator
+        # knows what flag to add.
+        emit("error", msg=f"[ABORT endpoint_misconfigured] {e}")
+        if getattr(e, "detail", ""):
+            emit("error", msg=f"  endpoint said: {e.detail[:300]}")
+        emit("error", msg=(
+            "  → for vLLM endpoints, restart with:"
+            "  --enable-auto-tool-choice --tool-call-parser <hermes|llama3_json|mistral>"
+        ))
+        progress.log(f"ABORT: endpoint misconfigured — {e}")
+        _interrupted_for_reraise = None
     except KeyboardInterrupt as e:
         # SIGTERM or Ctrl+C: we want to salvage whatever rounds were spent so
         # the next build's memory-aware budgets see this partial run. The
