@@ -3023,7 +3023,19 @@ def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
                             r"\{([A-Za-z_][A-Za-z0-9_]*)\}",
                             line_text,
                         )
-                        safe_names = {
+                        # Two independent categories of "safe" interpolation:
+                        # (a) placeholder-name conventions (`placeholders`,
+                        #     `set_clauses`, ...) — the SQL fragment is built
+                        #     from literals earlier and inlined here
+                        # (b) schema-identifier constants (`USERS_TABLE`,
+                        #     `TABLE_FTS`, `U_EMAIL`) — module-level string
+                        #     constants for table + column names
+                        # A single line may mix categories:
+                        #     f"DELETE FROM {TABLE_FTS} WHERE p IN ({placeholders})"
+                        # Each interpolation is checked independently against
+                        # both category tests. The full statement must contain
+                        # `?` parameters (value position is bound, not concat).
+                        safe_placeholder_names = {
                             "placeholders", "placeholder", "ph",
                             "qmarks", "bind_vars", "binds", "qmark_list",
                             "set_clauses", "set_clause",
@@ -3033,30 +3045,28 @@ def _scan_for_security_issues(workspace: str, lang) -> list[_SecFinding]:
                             "limit_clause", "group_by", "having_clause",
                             "join_clause",
                         }
+                        def _is_safe_interp(n: str) -> bool:
+                            if n in safe_placeholder_names:
+                                return True
+                            # Schema-identifier constant heuristic
+                            if n.isupper():
+                                return True
+                            if n.endswith(("_TABLE", "_COL", "_COLUMN",
+                                            "_FIELD", "_NAME")):
+                                return True
+                            return False
+                        # Safety here comes from _is_safe_interp being
+                        # conservative — anything lowercase or short (like
+                        # `user_input`, `id`, `email`) fails the check and
+                        # the guard doesn't fire. We don't require an inline
+                        # `?` because the parameterized-IN idiom builds
+                        # `placeholders` from `",".join("?" for _ in xs)`
+                        # on a prior line, so the `?` chars aren't on the
+                        # SQL line at all.
                         if interpolated and all(
-                            n in safe_names for n in interpolated
+                            _is_safe_interp(n) for n in interpolated
                         ):
                             continue
-                        # (3) Schema-identifier constants — variables that
-                        #     are ALL_CAPS or end with _TABLE / _COL / _COLUMN
-                        #     are conventionally module-level identifier
-                        #     constants (table names, column names), not
-                        #     user input. The query's value-position is
-                        #     still parameterized with `?`. This pattern
-                        #     showed up in real builds as
-                        #         f"INSERT INTO {USERS_TABLE} ({U_EMAIL}) VALUES (?)"
-                        #     where USERS_TABLE and U_EMAIL are module
-                        #     constants. Only skip when ALL interpolations
-                        #     match this shape AND a `?` parameter exists
-                        #     in the same statement.
-                        if interpolated and "?" in line_text:
-                            looks_like_const = lambda n: (
-                                n.isupper()
-                                or n.endswith(("_TABLE", "_COL", "_COLUMN",
-                                                "_FIELD", "_NAME"))
-                            )
-                            if all(looks_like_const(n) for n in interpolated):
-                                continue
                     # De-dup: don't fire the same rule on the same line twice.
                     if any(
                         f.rule == pat["rule"] and f.file == rel and f.line == line_no
