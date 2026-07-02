@@ -125,22 +125,60 @@ class TestSqlInjection(unittest.TestCase):
                 f"schema-identifier-constant pattern must not be flagged; got: {errors}",
             )
 
-    def test_schema_identifier_pattern_requires_question_mark(self):
-        """The schema-constant guard ONLY fires when `?` parameters are
-        present in the same statement. A naked f-string with NO `?` and
-        only constants is still suspicious (the values must be coming
-        from somewhere) — keep flagging it."""
+    def test_schema_only_query_no_user_input_not_flagged(self):
+        """A naked `f"SELECT * FROM {TABLE}"` where `TABLE` is a schema
+        constant and there are NO other interpolations is safe: no
+        pathway exists for user data to enter the query. The 2026-07-02
+        MCP-build FP fix relaxed the earlier "`?` required" rule after
+        it was found overly cautious — the real safety comes from the
+        `_is_safe_interp` heuristic rejecting anything lowercase or short
+        (like `user_input`, `id`, `email`) so real injection still flags."""
         with tempfile.TemporaryDirectory() as td:
-            # No `?` placeholder — the constants are the only interpolation
-            # but there's no parameterized value position. Stays flagged.
             _write(td, "repo.py",
                    'TABLE = "users"\n'
                    'def get():\n'
                    '    return conn.execute(f"SELECT * FROM {TABLE}")\n')
             errors, _ = _findings(td)
+            self.assertFalse(
+                any("sql_fstring" in e.output for e in errors),
+                "constant-only interpolation with no user data must not flag",
+            )
+
+    def test_mixed_constant_and_placeholder_not_flagged(self):
+        """Real FP surfaced on today's MCP-server build:
+            f"DELETE FROM {TABLE_FTS} WHERE path IN ({placeholders})"
+        Mixes a schema constant (TABLE_FTS) with a placeholder-name
+        (`placeholders` from a `,`-joined `?` string). Each interpolation
+        is independently safe by category. Both must pass the check
+        together."""
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "db.py",
+                   'TABLE_FTS = "files_fts"\n'
+                   'async def delete_many(conn, paths):\n'
+                   '    placeholders = ",".join("?" for _ in paths)\n'
+                   '    await conn.execute(\n'
+                   '        f"DELETE FROM {TABLE_FTS} WHERE path IN ({placeholders})",\n'
+                   '        paths,\n'
+                   '    )\n')
+            errors, _ = _findings(td)
+            self.assertFalse(
+                any("sql_fstring" in e.output for e in errors),
+                f"mixed constant+placeholder pattern must not flag; got: {errors}",
+            )
+
+    def test_injection_mixed_with_constant_still_flagged(self):
+        """Adversarial: if ONE interpolation is a schema constant but
+        ANOTHER is a raw user variable, the whole expression must still
+        flag. Every interpolation has to independently pass the check."""
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "repo.py",
+                   'TABLE_X = "x"\n'
+                   'def get(user_input):\n'
+                   '    return cursor.execute(f"SELECT * FROM {TABLE_X} WHERE id={user_input}")\n')
+            errors, _ = _findings(td)
             self.assertTrue(
                 any("sql_fstring" in e.output for e in errors),
-                "no `?` means we can't prove values are parameterized; must flag",
+                "mixed constant + user-input must still flag",
             )
 
 
