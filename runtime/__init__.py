@@ -5,12 +5,18 @@ shape, runs it, and returns a `VerificationResult`. Engine code doesn't
 case-switch on strategy — it just consumes the result.
 
 Dispatch chain (first match wins):
-  1. HTTP backend detected (Flask/FastAPI/Express)  → http
-  2. Static site / browser-ext / wordpress           → skip (no surface)
-  3. Interactive (curses/pygame)                     → skip (smoke_run covers)
-  4. Runnable binary/CLI entry, no HTTP listener     → cli
-  5. Public API surface, no entry runner             → library
-  6. Otherwise                                       → skip
+  1. Static site / browser-ext / wordpress           → skip (no surface)
+  2. Interactive (curses/pygame)                     → skip (smoke_run covers)
+  3. MCP server (imports mcp SDK)                    → mcp (JSON-RPC over stdio)
+  4. HTTP backend detected (Flask/FastAPI/Express)  → http
+  5. Runnable binary/CLI entry, no HTTP listener     → cli
+  6. Public API surface, no entry runner             → library
+  7. Otherwise                                       → skip
+
+MCP dispatches BEFORE http and cli because MCP servers have a runnable
+entry (looks like CLI) but the correct probe uses JSON-RPC 2.0 over
+stdio, not argv. Getting this wrong produces 100% "false failure"
+noise on real MCP builds (measured on the 2026-07-02 build).
 
 Skip is always graceful — never blocks a build that has no surface to verify.
 """
@@ -47,7 +53,9 @@ def _load_runners() -> dict[str, callable]:
     from .http_runner import run as http_run
     from .cli_runner import run as cli_run
     from .library_runner import run as library_run
-    return {"http": http_run, "cli": cli_run, "library": library_run}
+    from .mcp_runner import run as mcp_run
+    return {"http": http_run, "cli": cli_run, "library": library_run,
+            "mcp": mcp_run}
 
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -81,7 +89,14 @@ def _pick_strategy(workspace: str, lang) -> tuple[str, str]:
         except Exception:
             pass
 
-    # (3) HTTP backend present?
+    # (3) MCP server — imports the mcp SDK and exposes a stdio server.
+    # Must come BEFORE http/cli because an MCP server looks like both
+    # (has a main.py entry) but neither probe is correct for it. The mcp
+    # runner speaks JSON-RPC 2.0 over stdin/stdout.
+    if family == "python" and _detect_mcp_server(workspace):
+        return ("mcp", "MCP server detected (imports mcp SDK)")
+
+    # (4) HTTP backend present?
     if family in ("python", "node"):
         try:
             from cadillac.validate import _wiring_detect_backend
@@ -90,16 +105,47 @@ def _pick_strategy(workspace: str, lang) -> tuple[str, str]:
         except Exception:
             pass
 
-    # (4) CLI — runnable entry point with no HTTP listener.
+    # (5) CLI — runnable entry point with no HTTP listener.
     if family in ("python", "compiled"):
         if _has_cli_entry(workspace, lang):
             return ("cli", "CLI entry detected")
 
-    # (5) Library — public API surface, no runner.
+    # (6) Library — public API surface, no runner.
     if _has_library_surface(workspace, lang):
         return ("library", "library API surface detected")
 
     return ("skip", "no runtime surface detected")
+
+
+def _detect_mcp_server(workspace: str) -> bool:
+    """True when any Python file in the workspace imports the mcp SDK.
+
+    Recognizes both spellings:
+        import mcp
+        from mcp import ...
+        from mcp.server.fastmcp import FastMCP
+        from mcp.server import Server
+    """
+    import os
+    import re
+    skip = {"node_modules", ".git", "__pycache__", "dist", "build",
+            "venv", ".venv", ".cadillac", "frontend"}
+    pattern = re.compile(r"^\s*(?:from|import)\s+mcp(?:\b|\.)",
+                          re.MULTILINE)
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if pattern.search(text):
+                return True
+    return False
 
 
 def _has_cli_entry(workspace: str, lang) -> bool:
