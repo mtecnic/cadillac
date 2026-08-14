@@ -62,13 +62,51 @@ class TestStdlibShadowNesting(unittest.TestCase):
             results = check_stdlib_conflicts(td, python_language())
         self.assertTrue(any(not r.passed for r in results))
 
-    def test_partially_packaged_path_is_still_a_shadow(self):
-        """A package nested under a NON-package dir is reachable top-level."""
+    def test_depth_two_is_never_a_shadow(self):
+        """Corrects an earlier assertion of mine that was simply wrong.
+
+        This case (`src/pkg/socket.py`) was originally asserted to shadow, on a
+        hand-wavy "reachable top-level" claim I never verified. For it to shadow
+        stdlib `socket`, `src/pkg/` ITSELF would have to be on sys.path — and if
+        `src/` is on sys.path you get `pkg.socket`, not `socket`. Depth 2 is
+        unreachable as a bare name either way, which the subprocess below
+        demonstrates rather than asserts.
+        """
+        import subprocess
+
         with tempfile.TemporaryDirectory() as td:
             _write(td, "src/pkg/__init__.py", "")
-            _write(td, "src/pkg/socket.py", "x = 1\n")
+            _write(td, "src/pkg/socket.py", "raise RuntimeError('project module')\n")
             results = check_stdlib_conflicts(td, python_language())
-        self.assertTrue(any(not r.passed for r in results))
+            # Prove the premise: `import socket` from the root, and from `src/`
+            # on sys.path, both resolve to the stdlib — never to the project.
+            from_root = subprocess.run(
+                ["python3", "-c", "import socket; print(socket.__file__)"],
+                cwd=td, capture_output=True, text=True)
+            from_src = subprocess.run(
+                ["python3", "-c", "import socket; print(socket.__file__)"],
+                cwd=os.path.join(td, "src"), capture_output=True, text=True)
+        self.assertEqual(from_root.returncode, 0)
+        self.assertNotIn("pkg", from_root.stdout)
+        self.assertEqual(from_src.returncode, 0)
+        self.assertNotIn("pkg", from_src.stdout)
+        self.assertTrue(all(r.passed for r in results),
+                        [r.output for r in results if not r.passed])
+
+    def test_nested_module_flagged_before_parent_package_is_built(self):
+        """Build-order regression: modules build in dependency waves, so a
+        nested module exists while its PARENT package's __init__.py is still
+        pending. Walking the whole __init__ chain failed a healthy module —
+        seen live on build 9 as `ctxpack/models/chunk.py shadows chunk` with
+        `ctxpack/__init__.py` not yet written."""
+        with tempfile.TemporaryDirectory() as td:
+            _write(td, "ctxpack/models/__init__.py", "")
+            _write(td, "ctxpack/models/chunk.py", "class Chunk: pass\n")
+            # NOTE: ctxpack/__init__.py deliberately absent.
+            self.assertFalse(os.path.exists(os.path.join(td, "ctxpack", "__init__.py")))
+            results = check_stdlib_conflicts(td, python_language())
+        self.assertTrue(all(r.passed for r in results),
+                        [r.output for r in results if not r.passed])
 
     def test_clean_tree_passes(self):
         with tempfile.TemporaryDirectory() as td:

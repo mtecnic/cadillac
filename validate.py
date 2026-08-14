@@ -945,25 +945,46 @@ _STDLIB_NAMES = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_name
 
 
 def _is_inside_python_package(file_dir: str, workspace: str) -> bool:
-    """True when every directory from `file_dir` up to `workspace` is a package.
+    """True when a file in `file_dir` cannot be imported as a TOP-LEVEL module.
 
-    A module can only shadow a stdlib name if it is importable as a TOP-LEVEL
-    module — i.e. its directory ends up on `sys.path`. A file nested inside a
-    package is imported by its dotted path (`ctxpack.types.chunk`) and cannot
-    shadow `chunk` no matter what it is called.
+    Only a top-level-importable file can shadow a stdlib name, so this is the
+    skip condition for the stdlib-shadow checks. Decided by DEPTH below the
+    workspace root, with `__init__.py` only mattering at depth 1:
+
+      depth 0  `chunk.py`                  → importable as `chunk`. Shadows.
+      depth 1  `core/chunk.py`             → `core.chunk` when `core` is a
+                                             package. Without `__init__.py` the
+                                             directory can still land on
+                                             sys.path (src-layout, pytest
+                                             rootdir insertion), so treat it as
+                                             a shadow.
+      depth 2+ `ctxpack/models/chunk.py`   → never reachable as `chunk`. Under
+                                             PEP 420 it imports as
+                                             `ctxpack.models.chunk` with NO
+                                             `__init__.py` anywhere, so
+                                             presence of one is irrelevant.
+
+    The depth-2 rule matters for build ORDER, not just correctness: an earlier
+    version walked the whole `__init__.py` chain to the root, which failed a
+    nested module whose PARENT package had not been built yet (modules build in
+    dependency waves, so `ctxpack/models/` exists while `ctxpack/__init__.py`
+    is still pending). That reported a healthy module as shadowing stdlib.
     """
     workspace = os.path.abspath(workspace)
     current = os.path.abspath(file_dir)
     if current == workspace:
         return False  # workspace root: a file here IS top-level importable
-    while current != workspace:
-        if not os.path.exists(os.path.join(current, "__init__.py")):
-            return False
-        parent = os.path.dirname(current)
-        if parent == current:  # walked past the workspace, treat as top-level
-            return False
-        current = parent
-    return True
+
+    # Depth of file_dir below the workspace root.
+    rel = os.path.relpath(current, workspace)
+    if rel.startswith(".."):
+        return False  # outside the workspace; be conservative
+    depth = len([p for p in rel.split(os.sep) if p and p != "."])
+    if depth >= 2:
+        return True  # cannot be reached as a top-level module
+    # depth == 1: a package directory yields a dotted import; a plain directory
+    # may still end up on sys.path.
+    return os.path.exists(os.path.join(current, "__init__.py"))
 
 
 def check_stdlib_conflicts(workspace: str, lang=None) -> list[CheckResult]:
