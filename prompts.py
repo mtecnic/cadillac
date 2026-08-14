@@ -485,6 +485,7 @@ Rules:
 - "build_order" within each module: batch files within the module by dependency order
 - "module_build_order": waves of independent modules — earlier waves are built first
 - "integration_files": files that wire modules together ({entry_default}, top-level {init_file})
+- **LIBRARY LAYOUT** — if the task asks for a LIBRARY (something imported, with a public API, no CLI or server): every module path MUST be nested inside ONE top-level package directory named after the library, and "entry_point" MUST be `<package>/{init_file}`. So for a library named `mylib`: modules are `mylib/models/`, `mylib/core/`, and entry_point is `mylib/{init_file}`. Do NOT put the package contents at the project root and do NOT use a bare root `{init_file}` as entry_point — the result cannot be imported as `mylib` and every usage example fails with ModuleNotFoundError.
 - "dependencies": {package_desc}. Empty list if none.
 - "entry_point": must accept --test flag per the test plan
 - "test_file": integration test file at project root

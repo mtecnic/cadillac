@@ -1343,6 +1343,24 @@ def check_functional_smoke(workspace: str, entry_point: str = "main.py", lang=No
             missing.append("JS script tag")
         return [CheckResult("functional", False, f"index.html missing: {', '.join(missing)}")]
 
+    # A root __init__.py means the WORKSPACE DIRECTORY is being treated as the
+    # package, so the library cannot be imported by its own name — the
+    # workspace is called `workspace-<timestamp>`, not `mylib`. Build 10 shipped
+    # exactly this: `import ctxpack` -> ModuleNotFoundError with all 16 usage
+    # probes failing, while every static check passed, because each one
+    # exercises the code IN PLACE rather than as an installed package.
+    if (not lang or lang.family == "python") and os.path.exists(
+        os.path.join(workspace, "__init__.py")
+    ):
+        return [CheckResult(
+            "functional", False,
+            "Package contents are at the workspace root (a root __init__.py). The "
+            "library cannot be imported by its own name — move the package into a "
+            "directory named after it (e.g. `mylib/__init__.py`) and make that the "
+            "entry point.",
+            severity="error",
+        )]
+
     # Discover all packages and top-level modules
     packages = []
     empty_packages = []

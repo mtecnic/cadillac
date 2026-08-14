@@ -2190,6 +2190,63 @@ def _nonstatic_failure_fingerprints(results) -> set:
     return fingerprints
 
 
+RUNTIME_FAILURES_FILE = "runtime_failures.json"
+
+
+def _record_runtime_failures(workspace: str, strategy: str, failures) -> None:
+    """Persist unresolved runtime probe failures so the OUTCOME can see them.
+
+    RUNTIME is the only layer that exercises the artifact the way a user would.
+    When its failures could not be resolved (retreat blocked, retries spent),
+    the old code logged "advisory" and fell through to the success path — so a
+    build whose probes failed 16/16, twice, still reported
+    "[AUTO] All validations pass!" and packaged as COMPLETE. The signal was
+    correct and simply discarded.
+
+    Writing it to disk (rather than threading state through run() -> build())
+    matches how every other cross-phase artifact is passed, and makes the
+    result visible to `iterate`/`resume` as well.
+    """
+    path = os.path.join(workspace, ".cadillac", RUNTIME_FAILURES_FILE)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        from ._atomic import atomic_write_text
+        atomic_write_text(path, json.dumps({
+            "strategy": strategy,
+            "count": len(failures),
+            "failures": [
+                {
+                    "story_id": getattr(getattr(f, "probe", None), "story_id", "?"),
+                    "priority": getattr(getattr(f, "probe", None), "priority", "?"),
+                    "kind": getattr(f, "failure_kind", "?"),
+                    "detail": str(getattr(f, "detail", ""))[:300],
+                }
+                for f in list(failures)[:20]
+            ],
+        }, indent=2))
+    except Exception:
+        pass  # reporting aid; never break a build over it
+
+
+def _clear_runtime_failures(workspace: str) -> None:
+    """Drop the marker once runtime verification is clean."""
+    try:
+        os.remove(os.path.join(workspace, ".cadillac", RUNTIME_FAILURES_FILE))
+    except OSError:
+        pass
+
+
+def read_runtime_failures(workspace: str) -> dict | None:
+    """Unresolved runtime failures for this workspace, or None when clean."""
+    path = os.path.join(workspace, ".cadillac", RUNTIME_FAILURES_FILE)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("count") else None
+
+
 def _write_succeeded(result) -> bool:
     """True when a write_file / write_test tool result reports a real write.
 
@@ -4761,10 +4818,23 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                         "retreating to BUILD"
                                     )
                                     continue
+                                # Same discard as the RUNTIME path had: gaps the
+                                # critic found but the loop could not act on
+                                # were logged and forgotten, so the build still
+                                # reported success. Record them against the
+                                # outcome instead.
                                 emit("log", msg=(
                                     "[CRITIC] retreat blocked — validate "
-                                    "retries exhausted; logging as advisory"
+                                    f"retries exhausted; recording {len(actionable)} "
+                                    "unresolved gap(s) against the outcome"
                                 ))
+                                _record_runtime_failures(
+                                    workspace, "critic", actionable)
+                                emit("validation", results=[
+                                    {"name": "critic", "passed": False,
+                                     "output": f"{len(actionable)} spec gap(s) "
+                                               f"unresolved"}
+                                ])
                             else:
                                 emit("log", msg="[CRITIC] no actionable gaps")
                         except Exception as _e:
@@ -4837,16 +4907,34 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                         "probe failure(s); retreating to BUILD"
                                     )
                                     continue
+                                # Retreat blocked: these failures will NOT be
+                                # fixed, so record them. Previously this path
+                                # fell through to the success side and the
+                                # build reported COMPLETE with failing probes.
                                 emit("log", msg=(
                                     "[RUNTIME] retreat blocked — validate "
-                                    "retries exhausted; logging as advisory"
+                                    "retries exhausted; recording "
+                                    f"{len(actionable_rt)} unresolved probe "
+                                    "failure(s) against the outcome"
                                 ))
+                                _record_runtime_failures(
+                                    workspace, rt_result.strategy, actionable_rt)
+                                emit("validation", results=[
+                                    {"name": f"runtime/{rt_result.strategy}",
+                                     "passed": False,
+                                     "output": f"{len(actionable_rt)} probe failure(s) "
+                                               f"unresolved; the artifact does not "
+                                               f"behave as specified"}
+                                ])
                             elif rt_result.failures:
                                 # Only "could"-priority failures remain.
                                 emit("log", msg=(
                                     f"[RUNTIME] {len(rt_result.failures)} "
                                     "could-priority gap(s) — advisory only"
                                 ))
+                                _clear_runtime_failures(workspace)
+                            else:
+                                _clear_runtime_failures(workspace)
                         except Exception as _e:
                             emit("log", msg=f"[RUNTIME] crashed (advisory): {_e}")
 
@@ -5858,6 +5946,25 @@ def build(task: str, workspace: str, cfg: Config, max_iterations: int = 3,
         results = run_validation(workspace, entry_point, lang=lang)
         failures = format_failures(results)
         if not failures:
+            # Static validation being green is NOT the whole story. Every check
+            # in run_validation exercises the code in place; RUNTIME is the only
+            # layer that drives the artifact the way a user would, and its
+            # unresolved failures were previously discarded. Build 10 shipped
+            # "[AUTO] All validations pass!" for a library that could not be
+            # imported by its own name, with 16/16 probes failing twice.
+            rt = read_runtime_failures(workspace)
+            if rt:
+                emit("log", msg=(
+                    f"[AUTO] Static validation is green, but {rt['count']} "
+                    f"{rt.get('strategy', 'runtime')} probe failure(s) are "
+                    f"unresolved — NOT reporting success"
+                ))
+                for f in rt.get("failures", [])[:5]:
+                    emit("log", msg=(
+                        f"  [rt] {f.get('story_id')} [{f.get('priority')}] "
+                        f"{f.get('kind')} — {str(f.get('detail'))[:160]}"
+                    ))
+                break
             all_pass = True
             emit("log", msg="[AUTO] All validations pass!")
             break
