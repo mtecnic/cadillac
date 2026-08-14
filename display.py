@@ -86,6 +86,11 @@ class LiveDisplay:
                     self.validation[name] = "[red]FAIL[/red]"
         elif kind == "lesson":
             self.log_lines.append(f"[magenta]LESSON: {d.get('trigger', '')}[/magenta]")
+        elif kind == "retry":
+            self.log_lines.append(
+                f"[yellow]RETRY {d.get('attempt', '?')}/{d.get('max_attempts', '?')}: "
+                f"{d.get('reason_class', 'transient')} — waiting {d.get('delay', 0)}s[/yellow]"
+            )
         elif kind == "error":
             self.log_lines.append(f"[red]ERROR: {d.get('msg', '')}[/red]")
         elif kind == "module_start":

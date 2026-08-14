@@ -104,5 +104,13 @@ def default_print_handler(event: Event):
         print(f"Files: {d.get('files', 'none')}")
         print(f"Workspace: {d.get('workspace', '')}")
         print(f"{'═' * 60}")
+    elif kind == "retry":
+        print(
+            f"  [RETRY {d.get('attempt', '?')}/{d.get('max_attempts', '?')}] "
+            f"{d.get('reason_class', 'transient')} — waiting {d.get('delay', 0)}s",
+            flush=True,
+        )
+    elif kind == "file_written":
+        print(f"  [+] {d.get('path', '')}", flush=True)
     elif kind == "error":
         print(f"  [ERROR] {d.get('msg', '')}")

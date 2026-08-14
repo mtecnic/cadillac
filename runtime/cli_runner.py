@@ -147,6 +147,19 @@ def generate_runs(spec, workspace: str, lang, cfg, emit) -> list[ScriptedRun]:
 
     if spec is None or spec.is_empty():
         return []
+    # Reuse the suite from an earlier RUNTIME pass in this build when the spec
+    # is unchanged, so failure counts are comparable cycle to cycle and a
+    # repeated failure is detectable. A widened spec (next progressive tier)
+    # changes the fingerprint and regenerates.
+    from . import probe_cache
+    cached = probe_cache.load(workspace, "cli_runs.json", spec)
+    if cached:
+        reused = [r for r in (_run_from_dict(d) for d in cached) if r is not None]
+        if reused:
+            emit("log", msg=f"[RUNTIME/cli] reusing {len(reused)} cached run(s) "
+                            f"(same spec — comparable to the previous cycle)")
+            return reused
+
     user_msg = _build_generate_prompt(spec, workspace, lang)
     messages = [
         {"role": "system", "content": _GENERATE_SYSTEM_PROMPT},
@@ -173,14 +186,9 @@ def generate_runs(spec, workspace: str, lang, cfg, emit) -> list[ScriptedRun]:
         if r is not None:
             runs.append(r)
 
-    # Persist for inspection / iterate reuse.
-    try:
-        cad_dir = os.path.join(workspace, ".cadillac")
-        os.makedirs(cad_dir, exist_ok=True)
-        with open(os.path.join(cad_dir, "cli_runs.json"), "w") as f:
-            json.dump([_run_to_dict(r) for r in runs], f, indent=2)
-    except OSError:
-        pass
+    # Persist with the spec fingerprint so the next RUNTIME pass in this build
+    # reuses the same suite instead of generating a fresh, incomparable one.
+    probe_cache.save(workspace, "cli_runs.json", spec, [_run_to_dict(r) for r in runs])
 
     emit("log", msg=f"[RUNTIME/cli] {len(runs)} run(s) generated")
     return runs

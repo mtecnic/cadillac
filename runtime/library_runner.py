@@ -146,6 +146,19 @@ def generate_examples(spec, workspace: str, lang, cfg, emit) -> list[UsageExampl
 
     if spec is None or spec.is_empty():
         return []
+
+    # Reuse this build's earlier suite when the spec is unchanged, so failure
+    # counts are comparable across RUNTIME cycles instead of measuring a fresh
+    # set of examples each pass. See runtime/probe_cache.py.
+    from . import probe_cache
+    cached = probe_cache.load(workspace, "usage_examples.json", spec)
+    if cached:
+        reused = [e for e in (_example_from_dict(d) for d in cached) if e is not None]
+        if reused:
+            emit("log", msg=f"[RUNTIME/lib] reusing {len(reused)} cached example(s) "
+                            f"(same spec — comparable to the previous cycle)")
+            return reused
+
     messages = [
         {"role": "system", "content": _GENERATE_SYSTEM_PROMPT},
         {"role": "user", "content": _build_generate_prompt(spec, workspace, lang)},
@@ -171,13 +184,8 @@ def generate_examples(spec, workspace: str, lang, cfg, emit) -> list[UsageExampl
         if ex is not None:
             examples.append(ex)
 
-    try:
-        cad_dir = os.path.join(workspace, ".cadillac")
-        os.makedirs(cad_dir, exist_ok=True)
-        with open(os.path.join(cad_dir, "usage_examples.json"), "w") as f:
-            json.dump([_example_to_dict(e) for e in examples], f, indent=2)
-    except OSError:
-        pass
+    probe_cache.save(workspace, "usage_examples.json", spec,
+                     [_example_to_dict(e) for e in examples])
 
     emit("log", msg=f"[RUNTIME/lib] {len(examples)} example(s) generated")
     return examples

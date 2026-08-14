@@ -390,5 +390,25 @@ Examples:
         parser.print_help()
 
 
+def _main_guarded():
+    """Entry point wrapper: turn terminal provider failures into a clean exit.
+
+    `chat()` raises a ProviderFailure subclass when the endpoint is down,
+    misconfigured, out of quota, or returning empty completions. `run()` catches
+    those on the main build path, but the iterate / enhance / debug / resume
+    subcommands each drive their own chat loops. Without this, a dead endpoint
+    ends those commands in a raw traceback instead of a diagnostic.
+    """
+    from cadillac.engine import ProviderFailure
+    try:
+        main()
+    except ProviderFailure as e:
+        print(f"\n[abort] {type(e).__name__}: {e}", file=sys.stderr)
+        detail = getattr(e, "detail", "")
+        if detail:
+            print(f"  endpoint said: {detail[:300]}", file=sys.stderr)
+        sys.exit(3)
+
+
 if __name__ == "__main__":
-    main()
+    _main_guarded()

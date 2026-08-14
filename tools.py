@@ -336,6 +336,278 @@ def validate_path(path: str, workspace: str) -> bool:
     return full.startswith(ws_real + os.sep) or full == ws_real
 
 
+# ── Shape-based command policy ───────────────────────────────────────────────
+#
+# The allowlist above answers "is this program permitted?". It cannot answer
+# "what is this invocation going to touch?", and that is where the real holes
+# were: `rm -rf ..` and `echo x > ~/.bashrc` both use allowlisted programs and
+# both escape the workspace. `os.path.isabs("~/.bashrc")` is False (the shell
+# expands the tilde, not Python), so the old redirect check missed it entirely.
+#
+# These rules classify each command segment by what it will *touch* — resolving
+# every path-like token against the workspace — and deny by shape. Cadillac runs
+# unattended with no human approval gate, so this layer has to be the backstop
+# that an interactive agent gets from the user pressing "y".
+#
+# Design constraint: false positives break builds. Every rule below only fires
+# on tokens that genuinely look like filesystem paths, and legitimate build
+# traffic (`curl http://localhost:8000/health` in WIRING, `rm -rf node_modules`,
+# `cd frontend && npm install`, an in-workspace `.env`) must stay allowed. The
+# test suite pins both sides of each rule.
+
+# Wrappers that don't change what the underlying program does; skipped so
+# `timeout 60 rm -rf ..` is judged as `rm`.
+_WRAPPER_COMMANDS = frozenset({"timeout", "env", "command", "exec", "nice", "nohup", "true"})
+
+# Programs that write/destroy filesystem state. A path argument outside the
+# workspace is a hard denial for these.
+_WRITE_COMMANDS = frozenset({
+    "rm", "mv", "cp", "mkdir", "touch", "chmod", "tee", "truncate", "ln", "dd", "shred",
+})
+
+# Programs that read file contents or enumerate the filesystem. Used for the
+# credential-read and read-escape rules. `ls`/`find` are included: `ls ~/.ssh/`
+# and `find / -name id_rsa` are reconnaissance, and both were allowed before.
+_READ_COMMANDS = frozenset({
+    "cat", "head", "tail", "less", "more", "od", "xxd", "strings", "base64",
+    "cp", "mv", "grep", "sort", "uniq", "wc", "diff", "file", "stat",
+    "ls", "find", "tar", "zip",
+})
+
+# Network-capable programs on the allowlist. Used for the exfiltration rule.
+_NET_COMMANDS = frozenset({"curl", "wget", "nc", "ncat", "scp", "rsync", "ftp"})
+
+# Host credential locations. These never legitimately appear in a Cadillac
+# build, so they are denied wherever they resolve. Deliberately EXCLUDES bare
+# `.env`: generated projects create their own `.env` inside the workspace and
+# that is normal — an out-of-workspace `.env` is caught by the escape rule.
+_HOST_CRED_RE = re.compile(
+    r"(?:^|/)\.ssh(?:/|$)"
+    r"|(?:^|/)id_(?:rsa|dsa|ecdsa|ed25519)\b"
+    r"|(?:^|/)\.aws/credentials"
+    r"|(?:^|/)\.(?:netrc|npmrc|pgpass|htpasswd|git-credentials)\b"
+    r"|(?:^|/)\.docker/config\.json"
+    r"|(?:^|/)\.kube/config"
+    r"|/etc/(?:shadow|sudoers)\b",
+    re.IGNORECASE,
+)
+
+# Credential-ish names that are only suspicious OUTSIDE the workspace.
+_OUTSIDE_CRED_RE = re.compile(
+    r"(?:^|/)[^/]*\.env(?:\.|$)"
+    r"|(?:^|/)[^/]*\.(?:pem|key)$"
+    r"|(?:^|/)credentials?$",
+    re.IGNORECASE,
+)
+
+_URL_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
+
+# Device paths that are ordinary shell plumbing, not filesystem escapes.
+# `cat /dev/null > tsconfig.json` and `... 2>/dev/null` are everywhere in real
+# build traffic. Any OTHER /dev/ path still falls through to the escape rule
+# (it resolves outside the workspace), and redirecting INTO a device is judged
+# separately by the device_overwrite rule, so this stays safe.
+_BENIGN_DEVICES = frozenset({
+    "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random",
+    "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty",
+})
+
+
+def _expand_path_token(token: str) -> str:
+    """Expand ~ and $HOME/${HOME} in a token the way the shell would.
+
+    `os.path.isabs("~/.bashrc")` is False, which is exactly how the old
+    redirect guard was bypassed. Expanding first makes the escape visible.
+    """
+    token = token.strip().strip("'\"")
+    if token.startswith("@"):  # curl -d @file
+        token = token[1:]
+    token = token.replace("${HOME}", os.path.expanduser("~")).replace("$HOME", os.path.expanduser("~"))
+    return os.path.expanduser(token)
+
+
+def _looks_like_path(token: str) -> bool:
+    """True when a token is plausibly a filesystem path.
+
+    Conservative on purpose: anything with whitespace (a `python3 -c` payload),
+    a URL scheme, or a leading dash is not treated as a path, so inline code and
+    flags never trip the escape rules.
+    """
+    if not token or token.startswith("-"):
+        return False
+    if _URL_RE.match(token):
+        return False
+    if any(c.isspace() for c in token):
+        return False
+    return "/" in token or token in (".", "..") or token.startswith((".", "~", "$HOME", "${HOME}"))
+
+
+def _escapes_workspace(token: str, workspace: str) -> bool:
+    """True when a path-like token resolves outside the workspace."""
+    expanded = _expand_path_token(token)
+    if not expanded:
+        return False
+    base = os.path.realpath(workspace)
+    full = os.path.realpath(expanded if os.path.isabs(expanded) else os.path.join(workspace, expanded))
+    return not (full == base or full.startswith(base + os.sep))
+
+
+def _extract_subshells(command: str) -> list[str]:
+    """Return the bodies of $(...), `...`, and (...) so nested commands are judged.
+
+    The old `_split_command_parts` respects quotes but never descends, so
+    `echo $(rm -rf ..)` presented as a single allowlisted `echo` invocation.
+
+    Quote-aware, matching real shell semantics: nothing inside single quotes is
+    a substitution; inside double quotes `$(` and backticks still expand but a
+    bare `(` is literal text. Without this, a `python3 -c "f(0, '..')"` payload
+    reads as a subshell and trips the allowlist on its arguments.
+    """
+    bodies: list[str] = []
+    i = 0
+    n = len(command)
+    in_single = False
+    in_double = False
+    while i < n:
+        c = command[i]
+        if c == "\\" and not in_single and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single:
+            i += 1
+            continue
+        if c == "`":
+            close = command.find("`", i + 1)
+            if close == -1:
+                break
+            body = command[i + 1:close]
+            bodies.append(body)
+            bodies.extend(_extract_subshells(body))
+            i = close + 1
+            continue
+        # A bare `(` only opens a subshell outside double quotes; `$(` always does.
+        is_dollar_paren = c == "$" and i + 1 < n and command[i + 1] == "("
+        if is_dollar_paren or (c == "(" and not in_double):
+            start = i + 2 if is_dollar_paren else i + 1
+            depth = 1
+            j = start
+            while j < n and depth:
+                if command[j] == "(":
+                    depth += 1
+                elif command[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                body = command[start:j - 1]
+                bodies.append(body)
+                bodies.extend(_extract_subshells(body))
+                i = j
+                continue
+        i += 1
+    return bodies
+
+
+def _segment_tokens(part: str) -> list[str]:
+    """Tokenize one command segment, quote-aware, tolerant of shell syntax."""
+    import shlex
+    try:
+        return shlex.split(part, comments=False, posix=True)
+    except ValueError:
+        return part.split()
+
+
+def _redirect_targets(command: str) -> list[str]:
+    """Every redirect target in a command, including >> and 2>."""
+    out = []
+    for m in re.finditer(r"(?<![0-9<>])[0-9]?>>?\s*([^\s;|&()]+)", command):
+        target = m.group(1)
+        if target.startswith("&"):  # 2>&1
+            continue
+        out.append(target)
+    return out
+
+
+def _check_command_shape(command: str, workspace: str | None) -> tuple[bool, str]:
+    """Classify one command by what it touches and deny dangerous shapes.
+
+    Returns (allowed, reason). Called for the top-level command and, via
+    `_extract_subshells`, for every nested command substitution.
+    """
+    # Redirect targets: expanded before the escape test, so `> ~/.bashrc` and
+    # `> /etc/hosts` are both caught. Runs even without a workspace for the
+    # absolute-path case.
+    for target in _redirect_targets(command):
+        expanded = _expand_path_token(target)
+        if expanded.startswith("/dev/"):
+            if expanded not in ("/dev/null", "/dev/stdout", "/dev/stderr"):
+                return False, f"Blocked: redirect to device '{target}' (device_overwrite)"
+            continue
+        if workspace is not None:
+            if _escapes_workspace(target, workspace):
+                return False, f"Blocked: redirect outside workspace '{target}' (path_escape)"
+        elif os.path.isabs(expanded):
+            return False, f"Blocked: redirect to absolute path '{target}'"
+
+    for part in _split_command_parts(command):
+        part = re.sub(r"\d*>>&?\s*\S+", "", part)
+        part = re.sub(r"\d*>&?\d+", "", part)
+        tokens = _segment_tokens(part.strip())
+        while tokens and os.path.basename(tokens[0]) in _WRAPPER_COMMANDS:
+            tokens = tokens[1:]
+            # `timeout 60 cmd` / `env FOO=1 cmd`: drop the wrapper's own operands
+            while tokens and (re.fullmatch(r"\d+[smhd]?", tokens[0]) or "=" in tokens[0].split("/")[0]):
+                tokens = tokens[1:]
+        if not tokens:
+            continue
+        exe = os.path.basename(tokens[0])
+        args = [t for t in tokens[1:] if not t.startswith("-")]
+
+        # Host credential access — denied wherever it resolves.
+        for arg in args:
+            if _HOST_CRED_RE.search(_expand_path_token(arg)):
+                if exe in _READ_COMMANDS or exe in _WRITE_COMMANDS or exe in _NET_COMMANDS:
+                    return False, f"Blocked: host credential path '{arg}' (credential_access)"
+
+        # Credential exfiltration: a network program carrying a credential path.
+        if exe in _NET_COMMANDS:
+            for arg in args:
+                expanded = _expand_path_token(arg)
+                if _HOST_CRED_RE.search(expanded) or (
+                    workspace is not None
+                    and _looks_like_path(arg)
+                    and _escapes_workspace(arg, workspace)
+                    and _OUTSIDE_CRED_RE.search(expanded)
+                ):
+                    return False, f"Blocked: network command reading '{arg}' (credential_exfiltration)"
+
+        if workspace is None:
+            continue
+
+        # Path escape on write and read programs. `rm -rf ..` lands here.
+        if exe in _WRITE_COMMANDS or exe in _READ_COMMANDS:
+            for arg in args:
+                if not _looks_like_path(arg):
+                    continue
+                if _expand_path_token(arg).rstrip("/") in _BENIGN_DEVICES:
+                    continue
+                if _escapes_workspace(arg, workspace):
+                    expanded = _expand_path_token(arg)
+                    if _OUTSIDE_CRED_RE.search(expanded) or _HOST_CRED_RE.search(expanded):
+                        return False, f"Blocked: credential path outside workspace '{arg}' (credential_access)"
+                    verb = "writes" if exe in _WRITE_COMMANDS else "reads"
+                    return False, f"Blocked: {exe} {verb} outside workspace '{arg}' (path_escape)"
+
+    return True, ""
+
+
 def _split_command_parts(command: str) -> list[str]:
     """Split command on &&, ||, ;, | while respecting quotes and backslash escapes."""
     parts = []
@@ -374,28 +646,54 @@ def _split_command_parts(command: str) -> list[str]:
     return parts
 
 
-def validate_command(command: str) -> tuple[bool, str]:
-    """Check if a command is allowed."""
+def validate_command(command: str, workspace: str | None = None) -> tuple[bool, str]:
+    """Check if a command is allowed.
+
+    Three layers, in order:
+      1. BLOCKED_PATTERNS — known-dangerous literal shapes.
+      2. Allowlist — is this program permitted at all? (applied to nested
+         command substitutions too, not just the top level).
+      3. Shape policy — what will this invocation actually touch? Path escapes,
+         credential access, and exfiltration, resolved against `workspace`.
+
+    `workspace` is optional for backward compatibility; when omitted, layer 3
+    still runs the workspace-independent rules (host credentials, devices,
+    absolute-path redirects).
+
+    Fail-closed: an unexpected error inside the shape analysis denies the
+    command rather than letting it through. Cadillac has no human approval
+    gate, so an analyzer bug must not become an open door.
+    """
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, command):
             return False, f"Blocked: matches dangerous pattern"
-    # Block redirections to absolute paths (prevent writes outside workspace)
-    redirect_targets = re.findall(r'[12]?>+\s*(\S+)', command)
-    for target in redirect_targets:
-        if os.path.isabs(target):
-            return False, f"Blocked: redirect to absolute path '{target}'"
-    parts = _split_command_parts(command)
-    for part in parts:
-        # Strip redirections like 2>&1, 2>/dev/null, >/file
-        part = re.sub(r'\d*>>&?\s*\S+', '', part)  # 2>/dev/null, >>/file
-        part = re.sub(r'\d*>&?\d+', '', part)       # 2>&1
-        part = part.strip()
-        tokens = part.split()
-        if not tokens:
-            continue
-        cmd = os.path.basename(tokens[0])
-        if cmd not in ALLOWED_COMMANDS:
-            return False, f"Command '{cmd}' not in allowlist. Allowed: {', '.join(sorted(ALLOWED_COMMANDS))}"
+
+    # Allowlist over the top-level command AND every nested substitution, so
+    # `echo $(git push)` cannot smuggle a non-allowlisted program through.
+    for scope in [command, *_extract_subshells(command)]:
+        for part in _split_command_parts(scope):
+            part = re.sub(r'\d*>>&?\s*\S+', '', part)  # 2>/dev/null, >>/file
+            part = re.sub(r'\d*>&?\d+', '', part)       # 2>&1
+            part = part.strip()
+            tokens = part.split()
+            if not tokens:
+                continue
+            # Strip subshell/group punctuation so `(rm -rf ..)` reports as `rm`
+            # rather than the meaningless token `(rm`.
+            cmd = os.path.basename(tokens[0].lstrip("({").rstrip(")}"))
+            if not cmd:
+                continue
+            if cmd not in ALLOWED_COMMANDS:
+                return False, f"Command '{cmd}' not in allowlist. Allowed: {', '.join(sorted(ALLOWED_COMMANDS))}"
+
+    try:
+        for scope in [command, *_extract_subshells(command)]:
+            allowed, reason = _check_command_shape(scope, workspace)
+            if not allowed:
+                return False, reason
+    except Exception as e:  # pragma: no cover - defensive
+        return False, f"Blocked: command policy could not evaluate this command ({type(e).__name__})"
+
     return True, ""
 
 
@@ -608,6 +906,141 @@ TOOL_DEFS = [
         },
     },
 ]
+
+
+# ── Argument validation at the tool boundary ─────────────────────────────────
+#
+# The declared schema (TOOL_DEFS) is what the model is told; the method
+# signature is what actually runs. Validating against BOTH means:
+#   * a key the schema omits but the implementation accepts (read_file's
+#     `offset`/`limit`/`start_line` aliases) keeps working, and
+#   * a key neither accepts is reported by name with the real alternatives,
+#     instead of leaking a Python TypeError the model has to reverse-engineer.
+
+TOOL_SCHEMAS: dict[str, dict] = {
+    d["function"]["name"]: d["function"].get("parameters", {}) or {}
+    for d in TOOL_DEFS
+}
+
+_JSON_TYPE_COERCERS = {
+    # Scalars stringify (models often send 42 for a string field); containers
+    # do not — `str(['a','b'])` would silently become the literal "['a', 'b']".
+    "string": lambda v: v if isinstance(v, str) else (
+        str(v) if isinstance(v, (int, float, bool)) else None
+    ),
+    "integer": _coerce_int,
+    "number": lambda v: v if isinstance(v, (int, float)) else _coerce_int(v),
+    "boolean": lambda v: v if isinstance(v, bool) else (
+        True if str(v).strip().lower() in ("true", "1", "yes")
+        else False if str(v).strip().lower() in ("false", "0", "no", "none", "")
+        else None
+    ),
+    "array": lambda v: v if isinstance(v, list) else None,
+    "object": lambda v: v if isinstance(v, dict) else None,
+}
+
+
+def _accepted_parameters(method) -> set[str] | None:
+    """Parameter names the bound method actually accepts.
+
+    Returns None when the method takes **kwargs (accept anything). Used so the
+    validator never rejects an argument the implementation supports just
+    because the published schema doesn't mention it.
+    """
+    import inspect
+    try:
+        sig = inspect.signature(method)
+    except (TypeError, ValueError):
+        return None
+    names = set()
+    for name, param in sig.parameters.items():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return None
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            continue
+        if name == "self":
+            continue
+        names.add(name)
+    return names
+
+
+def validate_tool_args(fn_name: str, fn_args: dict, method=None) -> tuple[dict, str | None, list[str]]:
+    """Validate and coerce tool arguments against the declared schema.
+
+    Returns ``(cleaned_args, error, notes)``:
+      * ``error`` is a single actionable sentence when the call cannot proceed
+        (missing required parameter, or a required value of the wrong shape).
+      * ``notes`` records non-fatal corrections (dropped unknown keys, renamed
+        near-misses) so the model can self-correct without a failed round.
+
+    Fail-safe rather than fail-closed by design: this gate exists to save
+    round-trips, not to enforce security. The real boundaries (path
+    confinement, command policy, config guard) live inside the tool methods
+    and run after this. When intent is unambiguous the call proceeds.
+    """
+    from difflib import get_close_matches
+
+    schema = TOOL_SCHEMAS.get(fn_name, {})
+    properties: dict = schema.get("properties", {}) or {}
+    required: list = schema.get("required", []) or []
+    declared = set(properties)
+    accepted = _accepted_parameters(method) if method is not None else None
+    # Everything the call may legally carry: declared schema keys plus any
+    # extra keyword the implementation accepts.
+    allowed = declared if accepted is None else (declared | accepted)
+
+    cleaned: dict = {}
+    notes: list[str] = []
+
+    for key, value in fn_args.items():
+        if not isinstance(key, str):
+            notes.append(f"dropped non-string argument key {key!r}")
+            continue
+        if accepted is None or key in allowed:
+            cleaned[key] = value
+            continue
+        # Unknown key: try to rescue an obvious typo before dropping it.
+        match = get_close_matches(key, sorted(allowed), n=1, cutoff=0.75)
+        if match and match[0] not in fn_args:
+            cleaned[match[0]] = value
+            notes.append(f"renamed unknown argument '{key}' to '{match[0]}'")
+        else:
+            notes.append(f"dropped unknown argument '{key}'")
+
+    # Coerce declared types. A coercion that fails on an OPTIONAL parameter
+    # drops it with a note; on a REQUIRED one it is a hard error.
+    for key in list(cleaned):
+        spec = properties.get(key)
+        if not isinstance(spec, dict):
+            continue
+        coercer = _JSON_TYPE_COERCERS.get(spec.get("type"))
+        if coercer is None:
+            continue
+        coerced = coercer(cleaned[key])
+        if coerced is None and cleaned[key] is not None:
+            if key in required:
+                return cleaned, (
+                    f"{fn_name}: parameter '{key}' must be a {spec.get('type')}, "
+                    f"got {type(cleaned[key]).__name__}"
+                ), notes
+            del cleaned[key]
+            notes.append(f"dropped '{key}' (expected {spec.get('type')})")
+            continue
+        cleaned[key] = coerced
+
+    missing = [k for k in required if k not in cleaned or cleaned[k] is None]
+    if missing:
+        signature = ", ".join(
+            f"{name} ({(properties.get(name) or {}).get('type', 'any')})"
+            for name in properties
+        ) or "none"
+        return cleaned, (
+            f"{fn_name}: missing required parameter(s) "
+            f"{', '.join(repr(m) for m in missing)}. "
+            f"Accepted parameters: {signature}."
+        ), notes
+
+    return cleaned, None, notes
 
 
 # ── Tool implementations ─────────────────────────────────────────────────────
@@ -898,7 +1331,7 @@ class ToolExecutor:
         # Ubuntu 24.04 / Debian 12+ PEP 668: pip install against system
         # Python errors out; auto-add --break-system-packages when needed.
         command = _rewrite_pip_for_pep668(command)
-        allowed, reason = validate_command(command)
+        allowed, reason = validate_command(command, workspace=self.workspace)
         if not allowed:
             return {"error": reason}
         # Post-scaffold, block shell writes to protected config files.
@@ -1129,16 +1562,39 @@ class ToolExecutor:
     # ── Dispatch ──
 
     def dispatch(self, fn_name: str, fn_args: dict) -> dict:
-        """Execute a tool by name."""
+        """Execute a tool by name, validating arguments at the boundary.
+
+        Previously this was `method(**fn_args)` inside a bare try, so a single
+        hallucinated key surfaced as a Python traceback string:
+
+            Tool error (TypeError): write_file() got an unexpected keyword
+            argument 'filename'
+
+        The model then had to guess the real parameter name from a message that
+        never states it. Validating first turns that into one actionable line
+        naming the accepted parameters — and, where the intent is unambiguous
+        (a near-miss on a real parameter, or an extra key alongside a complete
+        valid call), the call proceeds instead of costing a round-trip.
+        """
         method = getattr(self, fn_name, None)
-        if method is None:
-            return {"error": f"Unknown tool: {fn_name}"}
+        if method is None or not callable(method) or fn_name.startswith("_"):
+            known = ", ".join(sorted(TOOL_SCHEMAS))
+            return {"error": f"Unknown tool: {fn_name}. Available tools: {known}"}
         if not isinstance(fn_args, dict):
-            return {"error": "Arguments must be a JSON object"}
+            return {"error": f"{fn_name}: arguments must be a JSON object, got {type(fn_args).__name__}"}
+
+        cleaned, error, notes = validate_tool_args(fn_name, fn_args, method)
+        if error:
+            return {"error": error}
         try:
-            return method(**fn_args)
+            result = method(**cleaned)
         except Exception as e:
             return {"error": f"Tool error ({type(e).__name__}): {e}"}
+        # Surface dropped/renamed keys alongside a successful result so the
+        # model corrects itself on the next call without a failed round.
+        if notes and isinstance(result, dict) and "error" not in result:
+            result = {**result, "arg_warnings": notes}
+        return result
 
     # ── Helpers ──
 

@@ -144,5 +144,8 @@ class Progress:
         if not self.workspace:
             return
         from ._atomic import atomic_write_text
+        from .redact import redact
         path = os.path.join(self.workspace, "progress.md")
-        atomic_write_text(path, self.to_markdown())
+        # Redacted: progress.md is written into the workspace, which is the
+        # published deliverable, and its log lines carry raw failure text.
+        atomic_write_text(path, redact(self.to_markdown()))

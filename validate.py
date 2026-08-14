@@ -657,6 +657,24 @@ def check_entry_point(workspace: str, entry_point: str = "main.py", lang=None) -
     """Run the entry point with --test flag."""
     entry = os.path.join(workspace, entry_point)
     if not os.path.exists(entry):
+        # A library has a public API and deliberately no runnable entry point,
+        # so demanding one is a guaranteed failure for an entire project class.
+        # Reuses the runtime dispatcher's own library detection rather than a
+        # second heuristic, so the two layers cannot disagree about what a
+        # library is. The library's real exercise is the `library` runtime
+        # strategy (runtime/library_runner.py), which imports the public
+        # surface and runs usage snippets against it.
+        try:
+            from .runtime import _has_library_surface
+            if _has_library_surface(workspace, lang):
+                return [CheckResult(
+                    "run", True,
+                    "library project (public API, no entry point) — execution "
+                    "deferred to the library runtime probes",
+                    severity="info",
+                )]
+        except Exception:
+            pass  # detection is advisory; fall through to the original failure
         return [CheckResult("run", False, f"Entry point {entry_point} not found")]
 
     # Static sites: just verify entry point exists (can't execute HTML)
@@ -926,14 +944,46 @@ _STDLIB_NAMES = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_name
 }
 
 
+def _is_inside_python_package(file_dir: str, workspace: str) -> bool:
+    """True when every directory from `file_dir` up to `workspace` is a package.
+
+    A module can only shadow a stdlib name if it is importable as a TOP-LEVEL
+    module — i.e. its directory ends up on `sys.path`. A file nested inside a
+    package is imported by its dotted path (`ctxpack.types.chunk`) and cannot
+    shadow `chunk` no matter what it is called.
+    """
+    workspace = os.path.abspath(workspace)
+    current = os.path.abspath(file_dir)
+    if current == workspace:
+        return False  # workspace root: a file here IS top-level importable
+    while current != workspace:
+        if not os.path.exists(os.path.join(current, "__init__.py")):
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:  # walked past the workspace, treat as top-level
+            return False
+        current = parent
+    return True
+
+
 def check_stdlib_conflicts(workspace: str, lang=None) -> list[CheckResult]:
-    """Check if any source files shadow stdlib/builtin modules."""
+    """Check if any source files shadow stdlib/builtin modules.
+
+    Only flags files that are actually importable as top-level modules. The
+    previous version matched on basename anywhere in the tree, so a perfectly
+    legal `ctxpack/types/chunk.py` (imported as `ctxpack.types.chunk`) was
+    reported as shadowing stdlib `chunk`. That fired on every module of a real
+    library build, failing each one on a non-issue.
+    """
     if lang and lang.family != "python":
         builtins = lang.stdlib_modules
         extensions = tuple(lang.extensions)
     else:
         builtins = _STDLIB_NAMES
         extensions = (".py",)
+    # Package nesting is a Python concept; other languages keep the old
+    # basename rule since their resolution semantics differ.
+    python_like = not (lang and lang.family != "python")
 
     conflicts = []
     for root, _, files in os.walk(workspace):
@@ -945,13 +995,16 @@ def check_stdlib_conflicts(workspace: str, lang=None) -> list[CheckResult]:
             if f.startswith("test_") or ".test." in f or ".spec." in f:
                 continue
             stem = os.path.splitext(f)[0]
-            if stem in builtins:
-                rel = os.path.relpath(os.path.join(root, f), workspace)
-                conflicts.append(
-                    CheckResult("naming", False,
-                                f"File '{rel}' shadows built-in module '{stem}' — rename it "
-                                f"(e.g., '{stem}_handler{extensions[0]}' or 'app_{stem}{extensions[0]}')")
-                )
+            if stem not in builtins:
+                continue
+            if python_like and _is_inside_python_package(root, workspace):
+                continue  # dotted import path — cannot shadow
+            rel = os.path.relpath(os.path.join(root, f), workspace)
+            conflicts.append(
+                CheckResult("naming", False,
+                            f"File '{rel}' shadows built-in module '{stem}' — rename it "
+                            f"(e.g., '{stem}_handler{extensions[0]}' or 'app_{stem}{extensions[0]}')")
+            )
     if not conflicts:
         return [CheckResult("naming", True)]
     return conflicts
@@ -1076,17 +1129,29 @@ def run_module_validation(workspace: str, module_path: str, module_test_file: st
     if not any(r.name == "syntax" for r in results):
         results.append(CheckResult("syntax", True))
 
-    # Scoped stdlib conflict check
+    # Scoped stdlib conflict check.
+    #
+    # Same nesting rule as check_stdlib_conflicts (this is a second, inline copy
+    # of that logic — it was missed when the workspace-level check was fixed,
+    # and immediately failed a module on `core/chunk.py`). A module directory
+    # that is itself a package makes its files dotted imports (`core.chunk`),
+    # which cannot shadow stdlib `chunk`. Only a module dir that is NOT a
+    # package can put its files on sys.path as top-level modules.
     stdlib_names = lang.stdlib_modules if lang else _STDLIB_NAMES
-    for f in os.listdir(module_dir):
-        if not f.endswith(exts):
-            continue
-        if f.startswith("test_") or ".test." in f or ".spec." in f:
-            continue
-        stem = os.path.splitext(f)[0]
-        if stem in stdlib_names:
-            results.append(CheckResult("naming", False,
-                f"File '{module_path}/{f}' shadows stdlib module '{stem}'"))
+    module_is_package = (
+        (lang is None or lang.family == "python")
+        and _is_inside_python_package(module_dir, workspace)
+    )
+    if not module_is_package:
+        for f in os.listdir(module_dir):
+            if not f.endswith(exts):
+                continue
+            if f.startswith("test_") or ".test." in f or ".spec." in f:
+                continue
+            stem = os.path.splitext(f)[0]
+            if stem in stdlib_names:
+                results.append(CheckResult("naming", False,
+                    f"File '{module_path}/{f}' shadows stdlib module '{stem}'"))
     if not any(r.name == "naming" for r in results):
         results.append(CheckResult("naming", True))
 
@@ -1153,9 +1218,20 @@ def run_module_validation(workspace: str, module_path: str, module_test_file: st
     # is the per-subsystem commissioning handoff, catching cross-module breakage
     # at the module level instead of waiting for final VALIDATE.
     if lang and lang.family == "python":
-        mod_name = os.path.basename(module_path.rstrip("/"))
-        # Only check module packages, not bare files (package has __init__.py)
-        if os.path.isdir(os.path.join(workspace, module_path.rstrip("/"))):
+        # Import by DOTTED PATH, not basename. Using the basename was wrong in
+        # both directions on a real nested build:
+        #   * false negative — `ctxpack/strategies` was probed as
+        #     `import strategies`, which cannot resolve, so a healthy module
+        #     failed; and
+        #   * false positive — `ctxpack/tokenizers` was probed as
+        #     `import tokenizers`, which happily resolved to HuggingFace's
+        #     installed `tokenizers` package. The module reported OK without
+        #     the check ever touching the project's code.
+        # `python3 -c` puts cwd first on sys.path, so the dotted form resolves
+        # to the workspace copy and cannot be satisfied by site-packages.
+        rel = module_path.rstrip("/").replace("\\", "/")
+        mod_name = ".".join(p for p in rel.split("/") if p and p != ".")
+        if os.path.isdir(os.path.join(workspace, rel)) and mod_name:
             probe = _run(
                 ["python3", "-c", f"import {mod_name}"],
                 cwd=workspace, timeout=10,
@@ -1680,6 +1756,287 @@ def check_framework_conflicts(
             f"Files: {'; '.join(parts)}. Pick ONE framework and use it everywhere.")]
 
     return [CheckResult("framework", True)]
+
+
+# --------------------------------------------------------------------------- #
+#  PWA MANIFEST + ASSET REFERENCE CHECKS                                      #
+# --------------------------------------------------------------------------- #
+#
+# A PWA `manifest.webmanifest` (or `manifest.json`) that ships with a missing
+# icon breaks the install prompt silently — no error surfaces until a user
+# tries to install. Similarly, `<img src="/sprites/player.png">` where the
+# file doesn't exist produces a broken image with no build-time signal.
+# Both are cheap static checks that catch bugs invisible to syntax/tests.
+
+
+def _looks_like_pwa_manifest(data: dict) -> bool:
+    """True when a JSON blob looks like a Web App Manifest (not MV3, not pkg)."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("manifest_version") in (2, 3):
+        return False  # browser extension
+    if "dependencies" in data or "devDependencies" in data or "scripts" in data:
+        return False  # package.json
+    return any(k in data for k in ("start_url", "display", "icons",
+                                    "short_name", "theme_color", "scope"))
+
+
+def _pwa_manifest_candidates(workspace: str) -> list[str]:
+    """Return paths of files that might be Web App Manifests."""
+    candidates: list[str] = []
+    filenames = ("manifest.webmanifest", "manifest.json", "site.webmanifest",
+                 "app.webmanifest")
+    for rel_dir in ("", "public", "static", "dist", "www", "assets"):
+        base = os.path.join(workspace, rel_dir) if rel_dir else workspace
+        if not os.path.isdir(base):
+            continue
+        for name in filenames:
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                candidates.append(p)
+    return candidates
+
+
+def _resolve_manifest_asset(workspace: str, manifest_dir: str, src: str) -> str | None:
+    """Try to resolve a manifest icon `src` to an existing file path.
+
+    Search order:
+      1. Absolute-from-web-root (src starts with /) — resolve against workspace
+         and each known public dir
+      2. Relative to manifest_dir
+    """
+    if not src or src.startswith(("http://", "https://", "data:")):
+        return src or None
+    if src.startswith("/"):
+        for base in (manifest_dir, workspace,
+                     os.path.join(workspace, "public"),
+                     os.path.join(workspace, "static"),
+                     os.path.join(workspace, "dist")):
+            cand = os.path.join(base, src.lstrip("/"))
+            if os.path.isfile(cand):
+                return cand
+        return None
+    cand = os.path.join(manifest_dir, src)
+    return cand if os.path.isfile(cand) else None
+
+
+def check_pwa_manifest(workspace: str, lang=None) -> list[CheckResult]:
+    """Validate any Web App Manifest present in the workspace.
+
+    Skips if no PWA-flavored manifest exists (browser extensions have
+    `manifest_version` and are excluded — those are covered by their own
+    quality block).
+    """
+    # PWA manifests only make sense for web-served surfaces. Compiled / PHP /
+    # PyTorch projects don't have them.
+    family = getattr(lang, "family", "") if lang else ""
+    if family in ("compiled", "php"):
+        return [CheckResult("pwa_manifest", True,
+                             f"{family} project — not applicable", "info")]
+
+    candidates = _pwa_manifest_candidates(workspace)
+    manifests: list[tuple[str, dict]] = []
+    for p in candidates:
+        try:
+            with open(p) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _looks_like_pwa_manifest(data):
+            manifests.append((p, data))
+
+    if not manifests:
+        return [CheckResult("pwa_manifest", True,
+                             "no Web App Manifest present, skipped", "info")]
+
+    problems: list[str] = []
+    for path, data in manifests:
+        rel = os.path.relpath(path, workspace)
+        manifest_dir = os.path.dirname(path)
+
+        # Required fields (per W3C Web App Manifest spec)
+        for field_name in ("name", "start_url"):
+            if not data.get(field_name):
+                problems.append(f"{rel}: missing required field {field_name!r}")
+
+        display = data.get("display")
+        if display and display not in ("standalone", "fullscreen",
+                                        "minimal-ui", "browser"):
+            problems.append(f"{rel}: display={display!r} is not one of the "
+                            "spec-valid values (standalone/fullscreen/"
+                            "minimal-ui/browser)")
+
+        icons = data.get("icons") or []
+        if not isinstance(icons, list) or not icons:
+            problems.append(f"{rel}: no icons declared — install prompt "
+                            "will fail on Chrome")
+        else:
+            for icon in icons[:20]:
+                if not isinstance(icon, dict):
+                    continue
+                src = icon.get("src", "")
+                resolved = _resolve_manifest_asset(workspace, manifest_dir, src)
+                if resolved is None:
+                    problems.append(
+                        f"{rel}: icon src {src!r} not found — check the file "
+                        "exists at the referenced path"
+                    )
+                if not icon.get("sizes"):
+                    problems.append(
+                        f"{rel}: icon {src!r} missing `sizes` — Chrome ignores "
+                        "icons without a size hint"
+                    )
+
+    if problems:
+        return [CheckResult("pwa_manifest", False,
+                             "\n".join(problems[:15]))]
+    return [CheckResult("pwa_manifest", True,
+                         f"{len(manifests)} manifest(s) valid")]
+
+
+# ── Asset reference check ────────────────────────────────────────────────────
+
+
+_ASSET_REF_SKIP_DIRS = {
+    "node_modules", ".git", "__pycache__", "dist", "build", ".next",
+    "venv", ".venv", ".cadillac", "coverage", ".pytest_cache",
+}
+
+_ASSET_REF_EXTS = (".html", ".htm", ".jsx", ".tsx", ".vue", ".svelte",
+                    ".js", ".ts", ".css", ".scss")
+
+# Skip these `src=`/`href=` values entirely.
+_ASSET_REF_SKIP_PREFIXES = (
+    "http://", "https://", "//", "data:", "mailto:", "tel:",
+    "javascript:", "blob:", "chrome-extension:", "#",
+)
+
+
+def _asset_ref_is_dynamic(val: str) -> bool:
+    """True when the ref is a template placeholder / expression, not a literal.
+
+    We can only file-check literal paths. Template variables (`${x}`,
+    `{{x}}`, `<%= x %>`, `{x}` mid-string) resolve at runtime.
+    """
+    return any(marker in val for marker in ("${", "{{", "<%", "}}"))
+
+
+def _asset_ref_candidates(workspace: str, ref: str) -> list[str]:
+    """Return absolute paths the ref might resolve to. First match wins."""
+    if ref.startswith("/"):
+        # Web-absolute — try workspace root and each public dir
+        rel = ref.lstrip("/").split("?")[0].split("#")[0]
+        return [
+            os.path.join(workspace, rel),
+            os.path.join(workspace, "public", rel),
+            os.path.join(workspace, "static", rel),
+            os.path.join(workspace, "dist", rel),
+            os.path.join(workspace, "src", rel),
+        ]
+    # Relative — caller resolves against its own directory
+    return []
+
+
+def check_asset_refs(workspace: str, lang=None) -> list[CheckResult]:
+    """Flag `<img src="...">`, `<link href="...">`, `url(...)` refs to
+    non-existent files.
+
+    Skips: absolute URLs (http/https/data/etc), template variables, refs
+    that resolve to an existing file via any of the well-known public
+    lookup paths.
+
+    Fires only for web-served projects (family in {"static", "node"} or
+    when index.html is present). Skips backend-only / compiled projects.
+    """
+    family = getattr(lang, "family", "") if lang else ""
+    name = getattr(lang, "name", "") if lang else ""
+    if family in ("compiled", "php"):
+        return [CheckResult("asset_refs", True,
+                             f"{family} project — not applicable", "info")]
+    if name in ("wordpress",):
+        return [CheckResult("asset_refs", True,
+                             f"{name} — assets validated by WP runtime", "info")]
+
+    # Bail if there's no web surface (backend-only Python project without
+    # any HTML/JS on the filesystem).
+    has_html = False
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _ASSET_REF_SKIP_DIRS]
+        for fn in files:
+            if fn.endswith((".html", ".htm", ".jsx", ".tsx", ".vue")):
+                has_html = True
+                break
+        if has_html:
+            break
+    if not has_html:
+        return [CheckResult("asset_refs", True,
+                             "no web templates present, skipped", "info")]
+
+    misses: list[tuple[str, int, str]] = []  # (file, line, ref)
+    src_href_pat = re.compile(
+        r'''(?:src|href)\s*=\s*["']([^"']+)["']'''
+    )
+    css_url_pat = re.compile(r'''url\(\s*["']?([^"')]+)["']?\s*\)''')
+
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _ASSET_REF_SKIP_DIRS]
+        for fn in files:
+            if not fn.endswith(_ASSET_REF_EXTS):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            for pat in (src_href_pat, css_url_pat):
+                for m in pat.finditer(text):
+                    val = m.group(1).strip()
+                    if not val:
+                        continue
+                    if val.startswith(_ASSET_REF_SKIP_PREFIXES):
+                        continue
+                    if _asset_ref_is_dynamic(val):
+                        continue
+                    # Strip query string / fragment
+                    clean = val.split("?")[0].split("#")[0]
+                    if not clean:
+                        continue
+                    # Only check refs that end in a file-like extension. A ref
+                    # like `href="/dashboard"` is a route, not an asset.
+                    if not re.search(
+                        r'\.(png|jpe?g|gif|svg|webp|ico|css|js|mjs|cjs|'
+                        r'woff2?|ttf|eot|json|webmanifest|mp3|wav|ogg|mp4|'
+                        r'webm|txt|pdf|xml)(?:[/?#].*)?$',
+                        clean,
+                        re.IGNORECASE,
+                    ):
+                        continue
+
+                    resolved_ok = False
+                    for cand in _asset_ref_candidates(workspace, clean):
+                        if os.path.isfile(cand):
+                            resolved_ok = True
+                            break
+                    if not resolved_ok and not clean.startswith("/"):
+                        # Relative — try relative to the referencing file's dir
+                        file_dir = os.path.dirname(path)
+                        cand = os.path.join(file_dir, clean)
+                        if os.path.isfile(cand):
+                            resolved_ok = True
+                    if not resolved_ok:
+                        line_no = text[:m.start()].count("\n") + 1
+                        misses.append((os.path.relpath(path, workspace),
+                                        line_no, val))
+
+    if misses:
+        lines = ["Referenced asset files do not exist:"]
+        for f, ln, ref in misses[:15]:
+            lines.append(f"  {f}:{ln} → {ref}")
+        if len(misses) > 15:
+            lines.append(f"  … and {len(misses) - 15} more")
+        return [CheckResult("asset_refs", False, "\n".join(lines))]
+    return [CheckResult("asset_refs", True, "all asset refs resolve")]
 
 
 # --------------------------------------------------------------------------- #
@@ -2605,6 +2962,11 @@ _SEC_SKIP_DIRS = (
     "node_modules", "__pycache__", "dist", "build", "venv", ".venv",
     ".git", ".cadillac", ".pytest_cache",
     "vendor",  # composer-installed PHP deps — never our code
+    "libs",    # static-JS convention: locally-hosted third-party libs
+               # (phaser.min.js, three.min.js, etc.) — flagging eval/innerHTML
+               # in a minified UMD blob is unactionable noise
+    "lib",     # same idea, alt spelling; also common for browser bundles
+    "third_party", "third-party", "vendored",
 )
 
 
@@ -3228,6 +3590,8 @@ def run_validation(
     from .operational import check_operational_gates
     results.extend(check_operational_gates(workspace, lang))
     results.extend(check_framework_conflicts(workspace, expected_packages=expected_packages, lang=lang))
+    results.extend(check_pwa_manifest(workspace, lang))    # PWA install prompt integrity
+    results.extend(check_asset_refs(workspace, lang))      # broken <img src>, <link href>, url()
     results.extend(check_functional_smoke(workspace, entry_point, lang))
     results.extend(check_entry_point(workspace, entry_point, lang))
     results.extend(check_smoke_run(workspace, lang))      # catches NameErrors in interactive-loop paths
@@ -3252,6 +3616,7 @@ def results_to_dict(results: list[CheckResult]) -> dict[str, bool | None]:
         "naming": None, "imports": None, "static_names": None,
         "syntax": None, "lint": None, "security": None,
         "operational": None, "framework": None,
+        "pwa_manifest": None, "asset_refs": None,
         "functional": None, "run": None, "smoke_run": None, "tests": None,
     }
     for r in results:

@@ -901,7 +901,19 @@ class Config:
     rate_limit: float = field(default_factory=lambda: float(os.getenv("CADILLAC_RATE_LIMIT", "0.25")))
 
 
-class EndpointUnreachable(RuntimeError):
+class ProviderFailure(RuntimeError):
+    """Base for every terminal provider outcome raised by chat().
+
+    Before this existed, chat() returned `{"role": "assistant", "content": ""}`
+    on exhausted retries. The phase loop consumed that sentinel as an ordinary
+    empty round — ticking the counter and draining budget — so a dead or
+    throttled endpoint looked exactly like a model that kept declining to act.
+    Every exhausted path now raises, and run() aborts the build cleanly with a
+    diagnostic that names the actual cause.
+    """
+
+
+class EndpointUnreachable(ProviderFailure):
     """Raised by chat() when all retries to the LLM endpoint failed with
     pure connection errors (socket refused, DNS fail, unreachable host).
 
@@ -915,7 +927,7 @@ class EndpointUnreachable(RuntimeError):
     """
 
 
-class EndpointMisconfigured(RuntimeError):
+class EndpointMisconfigured(ProviderFailure):
     """Raised by chat() when the endpoint rejects every request with a
     structural HTTP 400 — a config mismatch that NO retry will fix.
 
@@ -957,6 +969,140 @@ _ENDPOINT_MISCONFIG_SIGNATURES = (
 )
 
 
+class QuotaExhausted(ProviderFailure):
+    """Raised by chat() when the provider reports an exhausted quota.
+
+    Distinct from a transient 429. A rate limit clears on its own and is worth
+    retrying with backoff; an exhausted quota does not, and retrying it just
+    burns wall-clock before failing anyway. Top-level run() treats this like
+    the other terminal endpoint errors: abort cleanly with a diagnostic rather
+    than degrade into empty rounds.
+    """
+
+
+class EmptyResponse(ProviderFailure):
+    """Raised by chat() when the provider returns neither content nor tool
+    calls after the bounded retries are exhausted.
+
+    Previously this path returned `{"role": "assistant", "content": ""}`, which
+    the phase loop consumed as an ordinary (empty) round: the round counter
+    ticked, the budget drained, and the build looked like a model that kept
+    declining to act. An empty completion is an anomaly, not an answer, so it
+    now terminates truthfully.
+    """
+
+
+# Bounded retry policy. Worst-case cumulative wait is bounded by
+# RETRY_MAX_ATTEMPTS * RETRY_MAX_DELAY, so an unattended build cannot hang.
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+
+# Reason classes for a retryable provider failure. Reported through the event
+# emitter so build logs show WHY a retry happened, not just that one did.
+TRANSIENT_RATE_LIMITED = "rate_limited"
+TRANSIENT_SERVER_ERROR = "server_error"
+TRANSIENT_NETWORK_ERROR = "network_error"
+
+# Structured signals that a 429/403 is an exhausted quota rather than
+# throttling. Matched case-insensitively against the response body; a bare 429
+# (ordinary throttling) never qualifies, so the classification is
+# false-negative safe — an ambiguous 429 stays retryable.
+_QUOTA_SIGNATURES = (
+    "insufficient_quota",
+    "insufficient quota",
+    "quota_exceeded",
+    "quota exceeded",
+    "quota_exhausted",
+    "resource_exhausted",
+    "billing_quota_exceeded",
+    "quota_limit_reached",
+    "exceeded your current quota",
+)
+
+
+def is_quota_exhausted(status_code: int, body_text: str) -> bool:
+    """True when a 429/403 carries a documented exhausted-quota signal."""
+    if status_code not in (429, 403):
+        return False
+    body_lc = (body_text or "").lower()
+    return any(sig in body_lc for sig in _QUOTA_SIGNATURES)
+
+
+def parse_retry_after(headers) -> float | None:
+    """Parse a Retry-After header (delta-seconds) into seconds, clamped.
+
+    HTTP-date forms are ignored (treated as absent) rather than guessed at.
+    """
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, RETRY_MAX_DELAY)
+
+
+def classify_transient(status_code: int | None = None, exc: Exception | None = None,
+                       body_text: str = "") -> str | None:
+    """Classify a provider failure as retryable, returning its reason class.
+
+    Returns None for non-retryable failures (auth, invalid request, exhausted
+    quota) which must surface immediately instead of burning the retry budget.
+    """
+    if status_code is not None:
+        if is_quota_exhausted(status_code, body_text):
+            return None  # terminal — handled by the caller as QuotaExhausted
+        if status_code == 429:
+            return TRANSIENT_RATE_LIMITED
+        if status_code in (500, 502, 503, 504, 529):
+            return TRANSIENT_SERVER_ERROR
+        return None
+    if exc is not None:
+        import requests as _requests
+        if isinstance(exc, _requests.exceptions.ConnectionError):
+            return TRANSIENT_NETWORK_ERROR
+        if isinstance(exc, (_requests.exceptions.Timeout,
+                            _requests.exceptions.ChunkedEncodingError)):
+            return TRANSIENT_SERVER_ERROR
+        if isinstance(exc, _requests.exceptions.RequestException):
+            return TRANSIENT_NETWORK_ERROR
+    return None
+
+
+def backoff_delay(attempt: int, retry_after: float | None = None,
+                  rng=None) -> float:
+    """Exponential backoff with equal jitter, honoring a clamped Retry-After.
+
+    Jitter matters here specifically: `--parallel` module waves hit one local
+    vLLM instance, and a flat sleep makes every worker retry in lockstep. `rng`
+    is injectable so tests are deterministic.
+    """
+    if retry_after is not None and retry_after >= 0:
+        return min(retry_after, RETRY_MAX_DELAY)
+    import random
+    rand = rng if rng is not None else random.random
+    capped = min(RETRY_BASE_DELAY * (2 ** max(0, attempt - 1)), RETRY_MAX_DELAY)
+    return max(0.05, capped / 2 + (capped / 2) * rand())
+
+
+def _is_empty_completion(msg: dict) -> bool:
+    """True when an assistant message carries neither text nor a tool call."""
+    if not isinstance(msg, dict):
+        return True
+    if (msg.get("content") or "").strip():
+        return False
+    return not msg.get("tool_calls")
+
+
 # Per-endpoint last-send timestamp for client-side rate limiting.
 # Keyed by api_url so multiple endpoints don't throttle each other.
 _RATE_STATE: dict[str, float] = {}
@@ -988,10 +1134,17 @@ class BuildLogger:
         self._f = open(self.path, "a")
 
     def handler(self, event):
-        """EventEmitter listener — serialize event to JSONL."""
+        """EventEmitter listener — serialize event to JSONL.
+
+        Redacted before it hits disk: build.jsonl lives INSIDE the workspace,
+        and the workspace is the deliverable that gets published. Tool output,
+        shell stderr, and error bodies all flow through here verbatim
+        otherwise.
+        """
+        from .redact import redact_obj
         entry = {"ts": event.ts, "kind": event.kind, **event.data}
         try:
-            self._f.write(json.dumps(entry, default=str) + "\n")
+            self._f.write(json.dumps(redact_obj(entry), default=str) + "\n")
             self._f.flush()
         except (TypeError, ValueError):
             pass  # skip un-serializable events
@@ -1197,7 +1350,14 @@ def chat(cfg: Config, messages: list[dict], tools: list | None = None, emit=None
     all_conn_errors = True
     last_conn_error: Exception | None = None
 
-    for attempt in range(3):
+    # Empty completions get their own bounded retry budget: a stream that ends
+    # with no text AND no tool call is an anomaly worth re-asking for, but it
+    # must not loop forever.
+    empty_attempts = 0
+
+    attempt = 0
+    while attempt < RETRY_MAX_ATTEMPTS:
+        attempt += 1
         try:
             t0 = time.time()
             resp = requests.post(
@@ -1222,49 +1382,99 @@ def chat(cfg: Config, messages: list[dict], tools: list | None = None, emit=None
                             f" structurally — fix the endpoint config and re-run",
                             detail=body_text[:500],
                         )
+                # Exhausted quota is NOT a transient 429: retrying only burns
+                # wall-clock before failing identically.
+                if is_quota_exhausted(resp.status_code, body_text):
+                    raise QuotaExhausted(
+                        f"provider quota appears exhausted for model "
+                        f"'{cfg.model}' at {cfg.api_url}; retrying will not "
+                        f"help — restore quota and re-run"
+                    )
                 # 400 on attempt 1: try dropping the most recent assistant turn + its tool
                 # results — they may contain a poison message the server can't render.
-                if resp.status_code == 400 and attempt < 2 and len(messages) > 4:
+                if resp.status_code == 400 and attempt < RETRY_MAX_ATTEMPTS and len(messages) > 4:
                     drop_from = len(messages)
                     while drop_from > 2 and messages[drop_from - 1].get("role") in ("tool", "assistant"):
                         drop_from -= 1
                     if drop_from < len(messages):
                         emit("error", msg=f"[recovery] dropping last {len(messages) - drop_from} messages and retrying")
                         body["messages"] = messages[:drop_from]
-                if attempt < 2:
-                    time.sleep(3)
-                    continue
-                return {"role": "assistant", "content": ""}
+                        continue
+
+                reason_class = classify_transient(
+                    status_code=resp.status_code, body_text=body_text
+                )
+                if reason_class is None or attempt >= RETRY_MAX_ATTEMPTS:
+                    raise ProviderFailure(
+                        f"provider returned HTTP {resp.status_code} after "
+                        f"{attempt} attempt(s): {body_text[:200]}"
+                    )
+                delay = backoff_delay(attempt, parse_retry_after(resp.headers))
+                emit("retry", attempt=attempt + 1, max_attempts=RETRY_MAX_ATTEMPTS,
+                     reason_class=reason_class, delay=round(delay, 2))
+                time.sleep(delay)
+                continue
+
             data = resp.json()
             elapsed = time.time() - t0
             msg = data["choices"][0]["message"]
             usage = data.get("usage", {})
             finish = data["choices"][0].get("finish_reason", "?")
             content = (msg.get("content") or "").strip()
+
+            # An empty completion is an anomaly, not an answer. Returning the
+            # old `{"content": ""}` sentinel made the phase loop tick a round
+            # and drain budget on what looked like a model declining to act.
+            if _is_empty_completion(msg):
+                empty_attempts += 1
+                if empty_attempts >= RETRY_MAX_ATTEMPTS:
+                    raise EmptyResponse(
+                        f"provider returned an empty completion (no content, no "
+                        f"tool call) {empty_attempts} times in a row from "
+                        f"{cfg.api_url}"
+                    )
+                delay = backoff_delay(empty_attempts)
+                emit("retry", attempt=empty_attempts + 1, max_attempts=RETRY_MAX_ATTEMPTS,
+                     reason_class="empty_response", delay=round(delay, 2))
+                time.sleep(delay)
+                attempt -= 1  # an empty completion consumes its own budget, not the transport one
+                continue
+
             emit("llm", elapsed=elapsed, tokens=usage.get("completion_tokens", "?"),
                  finish=finish, content=content if content else None)
             return msg
         except requests.exceptions.ConnectionError as e:
             last_conn_error = e
             emit("error", msg=f"API ERROR: {e}")
-            if attempt < 2:
-                time.sleep(3)
+            if attempt < RETRY_MAX_ATTEMPTS:
+                delay = backoff_delay(attempt)
+                emit("retry", attempt=attempt + 1, max_attempts=RETRY_MAX_ATTEMPTS,
+                     reason_class=TRANSIENT_NETWORK_ERROR, delay=round(delay, 2))
+                time.sleep(delay)
                 continue
-            # All 3 attempts were pure connection errors — endpoint is objectively
+            # All attempts were pure connection errors — endpoint is objectively
             # down. Raise to the phase loop rather than return an empty sentinel
             # that would just cause the next round to fail identically.
             if all_conn_errors:
                 raise EndpointUnreachable(
-                    f"cannot reach {cfg.api_url} after 3 attempts: {e}"
+                    f"cannot reach {cfg.api_url} after {RETRY_MAX_ATTEMPTS} attempts: {e}"
                 ) from e
-            return {"role": "assistant", "content": ""}
+            raise ProviderFailure(f"provider transport failed: {e}") from e
         except requests.exceptions.RequestException as e:
             all_conn_errors = False  # timeout / SSL / chunked-read — not a pure connection failure
             emit("error", msg=f"API ERROR: {e}")
-            if attempt == 0:
-                time.sleep(3)
+            reason_class = classify_transient(exc=e)
+            if reason_class is not None and attempt < RETRY_MAX_ATTEMPTS:
+                delay = backoff_delay(attempt)
+                emit("retry", attempt=attempt + 1, max_attempts=RETRY_MAX_ATTEMPTS,
+                     reason_class=reason_class, delay=round(delay, 2))
+                time.sleep(delay)
                 continue
-            return {"role": "assistant", "content": ""}
+            raise ProviderFailure(f"provider transport failed: {e}") from e
+
+    raise ProviderFailure(
+        f"provider did not return a usable completion after {RETRY_MAX_ATTEMPTS} attempts"
+    )
 
 
 def _handle_stream(resp, t0: float, emit) -> dict:
@@ -1655,11 +1865,16 @@ def process_tool_calls(
         nonlocal batch_nudge
         if not batch:
             return
+        # Results aligned with `batch`, so the write-tracking loop below can
+        # tell a successful write from a failed one. Without this the tracker
+        # only saw the CALL, never the outcome.
+        results = [None] * len(batch)
         if len(batch) == 1:
             tc, fn_name, fn_args = batch[0]
             summary = _display_call_summary(fn_name, fn_args)
             emit("tool_call", name=fn_name, summary=summary)
             result = executor.dispatch(fn_name, fn_args)
+            results[0] = result
             result_str = json.dumps(result)
             emit("tool_result", name=fn_name, summary=_result_summary(result_str))
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
@@ -1679,19 +1894,34 @@ def process_tool_calls(
                     except Exception as e:
                         indexed[futures[future]] = {"error": f"Parallel execution failed: {e}"}
             for i, (tc, fn_name, fn_args) in enumerate(batch):
+                results[i] = indexed[i]
                 result_str = json.dumps(indexed[i])
                 emit("tool_result", name=fn_name, summary=_result_summary(result_str))
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
-        # Check batch tracker for writes
-        for _, bn, ba in batch:
-            if bn in ("write_file", "write_test") and batch_tracker:
-                nudge = batch_tracker.file_written(ba.get("path", ""))
+        # Record writes that actually LANDED.
+        #
+        # This block used to run off the tool call's arguments alone, never the
+        # result: a write that failed (missing `content`, path escape, protected
+        # config, disk error) still marked the file done in progress state, told
+        # the batch tracker it existed, and emitted file_written. That produced
+        # premature "[ALL BATCHES COMPLETE] All planned files written" and a
+        # progress view that disagreed with the disk. It went unnoticed because
+        # --plain silently dropped file_written until the surface-parity work
+        # added it; the very next real build showed a failed write_file followed
+        # by a "[+] main.py" line.
+        for i, (_, bn, ba) in enumerate(batch):
+            if bn not in ("write_file", "write_test"):
+                continue
+            if not _write_succeeded(results[i]):
+                continue
+            path = ba.get("path", "")
+            if batch_tracker:
+                nudge = batch_tracker.file_written(path)
                 if nudge:
                     batch_nudge = nudge
-            if bn in ("write_file", "write_test"):
-                progress.mark_file_done(ba.get("path", ""))
-                emit("file_written", path=ba.get("path", ""))
+            progress.mark_file_done(path)
+            emit("file_written", path=path)
 
     for tc, fn_name, fn_args in parsed:
         if fn_name in ToolExecutor.PARALLEL_SAFE:
@@ -1838,11 +2068,61 @@ def _is_phase_stuck(fingerprints: list[str], threshold: int = 3, lookback: int =
 # ── Git integration (lightweight, for rollback) ──────────────────────────────
 
 def _git_init(workspace: str):
-    """Initialize a git repo in the workspace with an initial commit."""
+    """Initialize a git repo in the workspace with an initial commit.
+
+    The .gitignore is written BEFORE the first `git add -A`. Writing it only at
+    PACKAGE was too late: this init runs early for rollback support, so
+    `.cadillac/` (build.jsonl, checkpoint.json) was already tracked by commit 1,
+    and .gitignore has no effect on an already-tracked path. A published
+    workspace therefore still carried its entire build trace.
+    """
     import subprocess
+    _write_gitignore(workspace)
     subprocess.run(["git", "init", "-q"], cwd=workspace, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=workspace, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=workspace, capture_output=True)
+
+
+def _git_untrack_build_artifacts(workspace: str) -> bool:
+    """Untrack every file that the workspace's .gitignore now excludes.
+
+    Covers repos created before the ignore-at-init fix, where `git add -A` ran
+    with no .gitignore and staged everything. Rather than naming `.cadillac`
+    specifically, this asks git which TRACKED files are ignored
+    (`ls-files -i -c --exclude-standard`) and untracks exactly those — so
+    `__pycache__/*.pyc`, `node_modules/`, `dist/` and `.env` are covered too,
+    not just the build directory. A real completed build was found tracking 20+
+    `.pyc` files after a `.cadillac`-only repair.
+
+    Index-only: files stay on disk, they just stop being part of the
+    deliverable. Returns True when something was actually untracked.
+    """
+    import subprocess
+    if not os.path.isdir(os.path.join(workspace, ".git")):
+        return False
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "-i", "-c", "--exclude-standard"],
+        cwd=workspace, capture_output=True,
+    )
+    if listed.returncode != 0:
+        return False
+    paths = [p for p in listed.stdout.split(b"\0") if p]
+    if not paths:
+        return False
+    # `-f` is required, not optional: build.jsonl is appended to throughout the
+    # run, so its staged content differs from both the worktree and HEAD, and
+    # plain `git rm --cached` refuses with "use -f to force removal". `--cached`
+    # means index-only regardless, so the file is never removed from disk.
+    # Batched to stay clear of ARGV limits on a large tree.
+    ok = False
+    for i in range(0, len(paths), 200):
+        chunk = paths[i:i + 200]
+        removed = subprocess.run(
+            ["git", "rm", "--cached", "-f", "-q", "--", *[p.decode() for p in chunk]],
+            cwd=workspace, capture_output=True,
+        )
+        ok = ok or removed.returncode == 0
+    return ok
 
 
 def _git_checkpoint(workspace: str, phase_name: str):
@@ -1861,10 +2141,103 @@ def _git_rollback(workspace: str, n: int = 1):
 
 # ── Checkpointing ────────────────────────────────────────────────────────────
 
+CHECKPOINT_SCHEMA_VERSION = 2
+
+
+def _nonstatic_failure_fingerprints(results) -> set:
+    """Stable fingerprints for failing checks that `parse_static_errors` misses.
+
+    Test timeouts, runtime tracebacks and probe failures carry no file:line for
+    a surgical edit, so they were never fingerprinted at all — which is why
+    stuck-loop detection never fired on the failure modes that actually cause
+    loops. Normalisation strips the parts that legitimately vary between
+    otherwise-identical runs (durations, line numbers, addresses, temp paths)
+    so the same failure produces the same fingerprint round to round.
+    """
+    fingerprints = set()
+    for r in results or []:
+        if getattr(r, "passed", True):
+            continue
+        if getattr(r, "severity", "error") != "error":
+            continue
+        import hashlib
+        text = (getattr(r, "output", "") or "")[:400]
+        norm = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", text)
+        norm = re.sub(r"\b\d+\.\d+\s*(s|ms|sec)\b", "DUR", norm)
+        norm = re.sub(r"(?<=[:\s])\d+(?=[:\s])", "N", norm)
+        norm = re.sub(r"/tmp/[^\s'\"]+", "TMP", norm)
+        norm = re.sub(r"\s+", " ", norm).strip()
+        fingerprints.add(f"{getattr(r, 'name', '?')}:{hashlib.sha1(norm.encode()).hexdigest()[:12]}")
+    return fingerprints
+
+
+def _write_succeeded(result) -> bool:
+    """True when a write_file / write_test tool result reports a real write.
+
+    The tool returns `{"status": "ok", ...}` on success and `{"error": ...}` on
+    every failure path (validation error, path escape, protected config, tool
+    exception). A missing result (a batch slot that never ran) is not a success.
+    """
+    if not isinstance(result, dict):
+        return False
+    if "error" in result:
+        return False
+    return result.get("status") == "ok"
+
+
+def _budget_key(key) -> str:
+    """Serialize a budget-dict key, which may be a Phase OR a plain string.
+
+    `PhaseState.max_rounds` starts as `{Phase: int}` but the engine merges
+    `compute_budgets()` into it wholesale, and that function returns Phase keys
+    plus a literal `"max_total_rounds"` entry. Assuming enum keys here crashed
+    a real build at the first checkpoint.
+    """
+    return key.value if isinstance(key, Phase) else str(key)
+
+
+def _json_safe(value, _depth: int = 0):
+    """Coerce arbitrary PhaseState values into JSON-serializable form.
+
+    PhaseState fields are annotated loosely and hold richer runtime types than
+    the annotations suggest — `stuck_fingerprints` is declared `list` but the
+    BUILD loop appends `frozenset`s of error fingerprints (engine.py ~4755),
+    and `_is_phase_stuck` still types it `list[str]`. Two real builds died at a
+    checkpoint before this existed. Rather than enumerate every field's true
+    type, normalize structurally: sets become sorted lists, Phases become their
+    values, anything else unrecognized becomes its string form.
+    """
+    if _depth > 8:
+        return str(value)
+    if isinstance(value, Phase):
+        return value.value
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (set, frozenset)):
+        return sorted(_json_safe(v, _depth + 1) for v in value)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v, _depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {_budget_key(k): _json_safe(v, _depth + 1) for k, v in value.items()}
+    return str(value)
+
+
 def _save_checkpoint(workspace: str, state: PhaseState, manifest: FileManifest,
                      plan: dict | None, architecture_text: str, entry_point: str, task: str):
-    """Save build state for resume."""
+    """Save build state for resume.
+
+    Written atomically (temp + os.replace) — a crash between truncate and flush
+    used to leave an empty checkpoint.json, which makes the build unresumable.
+    `_atomic.py` exists for exactly this and was already adopted in
+    spec/progress/scratch/memory; this is the most resume-critical writer.
+
+    v2 additionally persists the computed phase budgets and the once-per-build
+    guard flags. Without them `resume()` rebuilt a default PhaseState, silently
+    reverting to DEFAULT_BUDGETS and re-firing CRITIC/RUNTIME on a build that
+    had already run them.
+    """
     checkpoint = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "phase": state.current.value,
         "round_in_phase": state.round_in_phase,
         "total_rounds": state.total_rounds,
@@ -1874,20 +2247,109 @@ def _save_checkpoint(workspace: str, state: PhaseState, manifest: FileManifest,
         "task": task,
         "architecture": architecture_text,
         "ts": time.time(),
+        # -- v2: budgets and guard flags --
+        # `state.max_rounds` has MIXED keys: compute_budgets() returns Phase
+        # keys plus a plain "max_total_rounds" string, and the engine merges
+        # the whole dict in via .update(). Serialize by key name either way.
+        "max_rounds": {_budget_key(k): n for k, n in state.max_rounds.items()},
+        "max_total_rounds": state.max_total_rounds,
+        "adversarial_retries": state.adversarial_retries,
+        "completeness_critic_done": state.completeness_critic_done,
+        "runtime_verify_done": state.runtime_verify_done,
+        "current_tier": state.current_tier,
+        # list[frozenset[str]] at runtime, despite the `list` annotation.
+        "stuck_fingerprints": _json_safe(state.stuck_fingerprints),
+        "surgical_fixes_attempted": _json_safe(state.surgical_fixes_attempted),
+        "phase_rounds_used": {_budget_key(k): n for k, n in state.phase_rounds_used.items()},
     }
     ckpt_dir = os.path.join(workspace, ".cadillac")
     os.makedirs(ckpt_dir, exist_ok=True)
-    with open(os.path.join(ckpt_dir, "checkpoint.json"), "w") as f:
-        json.dump(checkpoint, f, indent=2)
+    from ._atomic import atomic_write_text
+    # Fail-SAFE, not fail-closed: a checkpoint is a resume optimization, not a
+    # correctness requirement. Two real builds were killed at ~50 minutes by an
+    # unserializable field escaping this function. Losing a checkpoint costs a
+    # resume; aborting costs the whole build, so a write failure degrades to a
+    # warning and the build continues.
+    try:
+        atomic_write_text(
+            os.path.join(ckpt_dir, "checkpoint.json"),
+            json.dumps(checkpoint, indent=2, default=str),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        import sys as _sys
+        print(f"  [checkpoint] write failed, resume unavailable: "
+              f"{type(e).__name__}: {e}", file=_sys.stderr, flush=True)
 
 
 def _load_checkpoint(workspace: str) -> dict | None:
-    """Load checkpoint if it exists."""
+    """Load checkpoint if it exists.
+
+    Fails closed on a corrupt or truncated file: returns None (start fresh)
+    rather than raising into the caller. A v1 checkpoint still loads — the v2
+    fields are all optional on restore.
+    """
     path = os.path.join(workspace, ".cadillac", "checkpoint.json")
     if not os.path.exists(path):
         return None
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _restore_phase_state(checkpoint: dict, resume_phase: Phase) -> PhaseState:
+    """Rebuild a PhaseState from a checkpoint, preserving budgets and guards.
+
+    Any field the checkpoint doesn't carry (a v1 file) keeps its PhaseState
+    default, so an older checkpoint resumes exactly as it did before.
+    """
+    state = PhaseState()
+    state.current = resume_phase
+    state.total_rounds = checkpoint.get("total_rounds", 0)
+    state.validate_retries = checkpoint.get("validate_retries", 0)
+
+    phase_by_value = {p.value: p for p in Phase}
+
+    saved_budgets = checkpoint.get("max_rounds")
+    if isinstance(saved_budgets, dict):
+        for name, rounds in saved_budgets.items():
+            if not isinstance(rounds, int):
+                continue
+            phase = phase_by_value.get(name)
+            if phase is not None:
+                state.max_rounds[phase] = rounds
+            elif name == "max_total_rounds":
+                # Non-Phase key the engine merges in via compute_budgets();
+                # round-trip it so a resumed state matches a live one exactly.
+                state.max_rounds[name] = rounds
+    if isinstance(checkpoint.get("max_total_rounds"), int):
+        state.max_total_rounds = checkpoint["max_total_rounds"]
+
+    state.adversarial_retries = checkpoint.get("adversarial_retries", 0)
+    state.completeness_critic_done = bool(checkpoint.get("completeness_critic_done", False))
+    state.runtime_verify_done = bool(checkpoint.get("runtime_verify_done", False))
+    state.current_tier = checkpoint.get("current_tier", "all")
+    fingerprints = checkpoint.get("stuck_fingerprints")
+    if isinstance(fingerprints, list):
+        # Serialized as list-of-lists; the BUILD loop consumes these as sets
+        # (`set.intersection(*[set(s) for s in recent3])`), so restore the
+        # frozensets rather than leaving plain lists behind.
+        state.stuck_fingerprints = [
+            frozenset(fp) if isinstance(fp, (list, set, frozenset)) else fp
+            for fp in fingerprints
+        ]
+    attempted = checkpoint.get("surgical_fixes_attempted")
+    if isinstance(attempted, list):
+        state.surgical_fixes_attempted = set(attempted)
+    used = checkpoint.get("phase_rounds_used")
+    if isinstance(used, dict):
+        for name, rounds in used.items():
+            phase = phase_by_value.get(name)
+            if phase is not None and isinstance(rounds, int):
+                state.phase_rounds_used[phase] = rounds
+    return state
 
 
 # ── Workspace loader (for iterate/debug) ─────────────────────────────────────
@@ -2394,6 +2856,17 @@ def _build_module(
     if errors:
         error_msgs = [f"[{r.name}] {r.output[:200]}" for r in errors]
         emit("log", msg=f"[MODULE {module_name}] Validation: {len(errors)} error(s)")
+        # Emit the ACTUAL failures, not just the count. Previously only the
+        # count reached the log and build.jsonl while the detail went into the
+        # model's message context and was then lost — so a post-mortem could
+        # see that a module failed but never why, and you had to re-run the
+        # validation by hand to find out. `validation` is a declared event kind
+        # (see surfaces.py) that both the plain and rich surfaces render.
+        emit("validation", results=[
+            {"name": f"{module_name}/{r.name}", "passed": False,
+             "output": (r.output or "")[:300]}
+            for r in errors
+        ])
         # Persist module failure context into module scratch for the next wave
         try:
             executor.scratch.append(
@@ -2429,8 +2902,11 @@ def _build_module(
             "success": True,
             "ts": time.time(),
         }
-        with open(os.path.join(ckpt_dir, f"{module_name}.checkpoint.json"), "w") as f:
-            json.dump(ckpt, f, indent=2)
+        from ._atomic import atomic_write_text
+        atomic_write_text(
+            os.path.join(ckpt_dir, f"{module_name}.checkpoint.json"),
+            json.dumps(ckpt, indent=2),
+        )
     except Exception as e:
         emit("log", msg=f"[MODULE {module_name}] Checkpoint save failed: {e}")
 
@@ -4440,13 +4916,43 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                     try:
                         from .surgical import parse_static_errors, surgical_fix
                         retry_errors = parse_static_errors(results)
-                        retry_fps = frozenset(e.fingerprint for e in retry_errors)
+                        # Fingerprint EVERY failing check, not just static ones.
+                        # `parse_static_errors` only understands lint/syntax/
+                        # undefined-name output, but builds actually get stuck on
+                        # test and runtime failures — so this detector fired zero
+                        # times across four real builds and `stuck_fingerprints`
+                        # stayed empty while the loop ground through its whole
+                        # budget. Static fingerprints stay separately available
+                        # for surgical targeting (a timeout has no file:line to
+                        # edit); the wider set is what detects repetition.
+                        static_fps = {e.fingerprint for e in retry_errors}
+                        retry_fps = frozenset(
+                            static_fps | _nonstatic_failure_fingerprints(results)
+                        )
                         state.stuck_fingerprints.append(retry_fps)
                         state.stuck_fingerprints = state.stuck_fingerprints[-5:]
                         if len(state.stuck_fingerprints) >= 3:
                             recent3 = state.stuck_fingerprints[-3:]
                             stuck_fps = set.intersection(*[set(s) for s in recent3])
+                            repeated = set(stuck_fps)
                             stuck_fps -= state.surgical_fixes_attempted
+                            # Repetition with nothing surgically fixable means
+                            # more BUILD rounds will reproduce it exactly. Stop
+                            # spending the remaining retries on a known-stuck
+                            # loop; exhausting them here routes to the existing
+                            # clean "max validation retries" exit.
+                            if repeated and not (stuck_fps & static_fps):
+                                emit("log", msg=(
+                                    f"[STUCK] {len(repeated)} failure(s) identical for 3 "
+                                    f"validation rounds with no surgically-fixable target "
+                                    f"— stopping retries instead of reproducing them"
+                                ))
+                                emit("validation", results=[
+                                    {"name": "stuck", "passed": False,
+                                     "output": f"repeated failure fingerprint: {fp}"}
+                                    for fp in sorted(repeated)[:5]
+                                ])
+                                state.validate_retries = state.max_validate_retries
                             if stuck_fps:
                                 for fp in sorted(stuck_fps):
                                     state.surgical_fixes_attempted.add(fp)
@@ -4519,7 +5025,10 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
     except EndpointUnreachable as e:
         emit("error", msg=f"[ABORT endpoint_down] {e}")
         progress.log(f"ABORT: endpoint unreachable — {e}")
-        _interrupted_for_reraise = None  # not a signal; outer build() decides
+        # Terminal: no further provider work is possible. Re-raised after the
+        # teardown block below (phase history, progress, log close) so build()
+        # cannot walk on into auto-iterate and burn another doomed call.
+        _interrupted_for_reraise = e
     except EndpointMisconfigured as e:
         # No amount of retries will fix this — the endpoint's config is wrong
         # for our request shape. Surface the specific failure so the operator
@@ -4532,7 +5041,25 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
             "  --enable-auto-tool-choice --tool-call-parser <hermes|llama3_json|mistral>"
         ))
         progress.log(f"ABORT: endpoint misconfigured — {e}")
-        _interrupted_for_reraise = None
+        _interrupted_for_reraise = e  # terminal; see endpoint_down above
+    except QuotaExhausted as e:
+        emit("error", msg=f"[ABORT quota_exhausted] {e}")
+        emit("error", msg="  → this is not a transient rate limit; it was not retried")
+        progress.log(f"ABORT: provider quota exhausted — {e}")
+        _interrupted_for_reraise = e  # terminal; see endpoint_down above
+    except EmptyResponse as e:
+        # The provider is alive but produced nothing usable. Truthfully
+        # terminal: the old sentinel let this drain the whole round budget
+        # while looking like a model that kept declining to act.
+        emit("error", msg=f"[ABORT empty_response] {e}")
+        progress.log(f"ABORT: provider returned empty completions — {e}")
+        _interrupted_for_reraise = e  # terminal; see endpoint_down above
+    except ProviderFailure as e:
+        # Catch-all for remaining terminal provider outcomes, so an exhausted
+        # retry budget aborts cleanly instead of escaping as a traceback.
+        emit("error", msg=f"[ABORT provider_failure] {e}")
+        progress.log(f"ABORT: provider failure — {e}")
+        _interrupted_for_reraise = e  # terminal; see endpoint_down above
     except KeyboardInterrupt as e:
         # SIGTERM or Ctrl+C: we want to salvage whatever rounds were spent so
         # the next build's memory-aware budgets see this partial run. The
@@ -4587,8 +5114,57 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
         raise _interrupted_for_reraise
 
 
+# Entries every generated project's .gitignore must carry. `.cadillac/` is the
+# critical one: it holds build.jsonl (the full event log) and checkpoint.json,
+# and the workspace IS the published deliverable — without this, a `git add .`
+# in a generated project commits the entire build trace.
+_GITIGNORE_REQUIRED = (
+    ".cadillac/",
+    "progress.md",
+    ".env",
+    ".env.local",
+    "__pycache__/",
+    "*.pyc",
+    ".venv/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    ".DS_Store",
+)
+
+
+def _write_gitignore(workspace: str) -> None:
+    """Ensure the generated project has a .gitignore covering build artifacts.
+
+    Merges into an existing file rather than overwriting: the build may have
+    written its own, and clobbering it would drop project-specific entries.
+    """
+    path = os.path.join(workspace, ".gitignore")
+    existing = ""
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                existing = f.read()
+        except OSError:
+            existing = ""
+    present = {line.strip() for line in existing.splitlines()}
+    missing = [e for e in _GITIGNORE_REQUIRED if e not in present]
+    if not missing:
+        return
+    body = existing.rstrip("\n")
+    header = "\n\n# Added by cadillac — build artifacts, never publish these\n" if body else ""
+    from ._atomic import atomic_write_text
+    atomic_write_text(path, f"{body}{header}" + "\n".join(missing) + "\n")
+
+
 def _write_package_files(workspace: str, manifest: FileManifest, task: str, plan: dict | None = None, lang=None):
     """Write README.md and requirements.txt/package.json deterministically from manifest data."""
+    # Idempotent: normally already written by _git_init before the first commit.
+    # Still needed for workspaces where git init never ran.
+    _write_gitignore(workspace)
+    # Repair the index for repos created before the ignore-at-init fix, so a
+    # published workspace stops carrying its own build trace.
+    _git_untrack_build_artifacts(workspace)
     deps = plan.get("dependencies", []) if plan else []
     default_entry = lang.entry_point if lang else "main.py"
     entry = plan.get("entry_point", default_entry) if plan else default_entry
@@ -4751,14 +5327,25 @@ def resume(workspace: str, cfg: Config, emitter: EventEmitter | None = None):
     phase_map = {p.value: p for p in Phase}
     resume_phase = phase_map.get(phase_name, Phase.BUILD)
 
-    # If resuming from SCAFFOLD or earlier, re-enter BUILD
-    if resume_phase in (Phase.PLAN, Phase.DEPS, Phase.SCAFFOLD, Phase.REVIEW):
+    # Re-enter BUILD from any phase that isn't independently resumable.
+    #
+    # Only BUILD and PACKAGE have resume handlers below; every other phase fell
+    # through to "Cannot resume from phase X" and gave up. That made a build
+    # that died during INTEGRATE / WIRING / VALIDATE unresumable — and VALIDATE
+    # is exactly where builds stall longest, so the common case was the broken
+    # one. (Found by resuming a real 147-round build that died at VALIDATE.)
+    #
+    # BUILD is the correct target: it is what run() itself retreats to when
+    # validation fails (PhaseState.retreat_to_build), and the resume path below
+    # already re-runs validation and feeds the failures into the build prompt.
+    # A checkpoint whose validation now passes is still promoted to PACKAGE
+    # further down, so a green resume does not get pushed back into BUILD.
+    if resume_phase not in (Phase.BUILD, Phase.PACKAGE):
         resume_phase = Phase.BUILD
 
-    state = PhaseState()
-    state.current = resume_phase
-    state.total_rounds = checkpoint.get("total_rounds", 0)
-    state.validate_retries = checkpoint.get("validate_retries", 0)
+    # Restores computed budgets and the once-per-build guard flags, so a
+    # resumed build doesn't revert to DEFAULT_BUDGETS or re-run CRITIC/RUNTIME.
+    state = _restore_phase_state(checkpoint, resume_phase)
 
     # Load lessons
     lessons = recall(task)
@@ -5220,7 +5807,23 @@ def build(task: str, workspace: str, cfg: Config, max_iterations: int = 3,
     emit = emitter.emit
 
     # Phase 1: Initial build (PLAN → DEPS → SCAFFOLD → REVIEW → BUILD → VALIDATE)
-    run(task, workspace, cfg, emitter=emitter, parallel=parallel)
+    try:
+        run(task, workspace, cfg, emitter=emitter, parallel=parallel)
+    except ProviderFailure as e:
+        # A terminal provider failure means every remaining phase that needs the
+        # model (auto-iterate, reflection) would fail identically — previously
+        # build() walked straight into iterate() and burned another doomed call
+        # before the error surfaced. Packaging is deterministic and needs no
+        # provider, so partial work still gets its README/.gitignore, then the
+        # failure propagates for a non-zero exit.
+        emit("log", msg="[PACKAGE] provider unavailable — packaging partial work")
+        try:
+            lang = detect_language(task, workspace)
+            plan, manifest = _load_workspace(workspace, lang=lang)
+            _write_package_files(workspace, manifest, task, plan, lang=lang)
+        except Exception as pkg_err:
+            emit("error", msg=f"[PACKAGE] could not package partial work: {pkg_err}")
+        raise
 
     # Phase 2: Auto-iterate until clean
     lang = detect_language(task, workspace)

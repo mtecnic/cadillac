@@ -96,19 +96,28 @@ class TestEndpointMisconfigDetection(unittest.TestCase):
                      emit=lambda *a, **k: None)
 
     def test_unrelated_400_does_NOT_raise_misconfig(self):
-        """A run-of-the-mill 400 (malformed JSON, bad role, etc.) should
-        still go through the existing retry-and-degrade path, not raise."""
+        """A run-of-the-mill 400 (malformed JSON, bad role, etc.) must not be
+        misclassified as a structural endpoint misconfiguration.
+
+        It is still terminal — a 400 is not retryable — but it surfaces as the
+        generic ProviderFailure so the operator isn't told to add vLLM
+        tool-parser flags that have nothing to do with the real fault.
+
+        (Updated when chat() stopped returning an empty-content sentinel on
+        exhaustion: the phase loop counted that sentinel as a normal round and
+        drained the budget. See tests/test_provider_retry.py.)
+        """
+        from cadillac.engine import ProviderFailure
+
         body = '{"error": "max_tokens exceeds context length"}'
-        # Need 3 calls' worth of fake responses (retries) — and an extra
-        # for the recovery-dropping path.
         fakes = [_FakeResp(400, body)] * 5
         with mock.patch("cadillac.engine.requests.post", side_effect=fakes), \
              mock.patch("cadillac.engine.time.sleep"):
-            msg = chat(_cfg(), [{"role": "user", "content": "hi"}],
-                       emit=lambda *a, **k: None)
-        # Falls through to the existing empty-content sentinel
-        self.assertEqual(msg.get("role"), "assistant")
-        self.assertEqual(msg.get("content", ""), "")
+            with self.assertRaises(ProviderFailure) as cm:
+                chat(_cfg(), [{"role": "user", "content": "hi"}],
+                     emit=lambda *a, **k: None)
+        self.assertNotIsInstance(cm.exception, EndpointMisconfigured)
+        self.assertIn("400", str(cm.exception))
 
     def test_signatures_are_lowercase_compared(self):
         """Body matching should be case-insensitive — vLLM sometimes

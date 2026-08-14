@@ -62,9 +62,15 @@ def save_lesson(lesson: Lesson):
     """Append one lesson to memory.jsonl. Lock-protected to serialize
     concurrent appends from parallel module builds — without the lock,
     two threads' writes can interleave and produce malformed JSON lines
-    that load_lessons() silently skips, losing data. (Audit H2.)"""
+    that load_lessons() silently skips, losing data. (Audit H2.)
+
+    Redacted before persistence: lessons are distilled from real failure text
+    (tracebacks, shell stderr, config dumps) and outlive the build, so one
+    leaked credential would be re-injected into every future build's prompt.
+    """
     from ._atomic import atomic_append_lines
-    atomic_append_lines(MEMORY_PATH, [json.dumps(asdict(lesson))])
+    from .redact import redact_obj
+    atomic_append_lines(MEMORY_PATH, [json.dumps(redact_obj(asdict(lesson)))])
 
 
 def save_all(lessons: list[Lesson]):

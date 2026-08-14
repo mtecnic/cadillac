@@ -2441,16 +2441,25 @@ class TestEndpointUnreachableAbort(unittest.TestCase):
             # grace; 9s of retry buffer in prod).
             self.assertEqual(post.call_count, 3)
 
-    def test_transient_timeout_still_returns_sentinel(self):
-        # Timeouts = endpoint alive-but-slow. Must NOT raise — the next round
-        # might succeed, and burning one round on sentinel is acceptable.
+    def test_transient_timeout_is_retried_then_terminal(self):
+        # Timeouts = endpoint alive-but-slow, so they ARE retried (that part is
+        # unchanged). What changed: once the bounded retries are exhausted the
+        # call raises instead of returning an empty-content sentinel.
+        #
+        # The old comment said "burning one round on sentinel is acceptable" —
+        # in practice it was not: the phase loop treated the sentinel as a
+        # normal empty round, so a persistently slow endpoint burned the ENTIRE
+        # round budget producing nothing, and the build reported as a model
+        # that kept declining to act rather than as an endpoint failure.
         import requests
-        from cadillac.engine import chat
+        from cadillac.engine import RETRY_MAX_ATTEMPTS, ProviderFailure, chat
         with mock.patch("cadillac.engine.requests.post") as post, \
              mock.patch("cadillac.engine.time.sleep"):
             post.side_effect = requests.exceptions.Timeout("slow")
-            result = chat(self._mock_cfg(), [{"role": "user", "content": "hi"}])
-        self.assertEqual(result, {"role": "assistant", "content": ""})
+            with self.assertRaises(ProviderFailure):
+                chat(self._mock_cfg(), [{"role": "user", "content": "hi"}])
+            self.assertEqual(post.call_count, RETRY_MAX_ATTEMPTS,
+                             "timeouts must still be retried before giving up")
 
     def test_one_connection_error_then_success(self):
         # Transient blip: 1× ConnectionError followed by success must succeed
@@ -2473,19 +2482,27 @@ class TestEndpointUnreachableAbort(unittest.TestCase):
             result = chat(self._mock_cfg(), [{"role": "user", "content": "hi"}])
         self.assertEqual(result.get("content"), "ok")
 
-    def test_mixed_failures_returns_sentinel(self):
+    def test_mixed_failures_do_not_escalate_to_endpoint_unreachable(self):
         # One ConnectionError then one Timeout means the endpoint WAS reachable
         # at some point — don't escalate to EndpointUnreachable.
+        #
+        # Updated: chat() no longer returns an empty-content sentinel on
+        # exhaustion. The phase loop counted that sentinel as an ordinary round,
+        # so a failing endpoint drained the whole budget while looking like a
+        # model declining to act. The distinction this test guards — mixed
+        # failures are NOT EndpointUnreachable — is unchanged.
         import requests
-        from cadillac.engine import chat
+        from cadillac.engine import EndpointUnreachable, ProviderFailure, chat
         with mock.patch("cadillac.engine.requests.post") as post, \
              mock.patch("cadillac.engine.time.sleep"):
             post.side_effect = [
                 requests.exceptions.ConnectionError("gone"),
                 requests.exceptions.Timeout("slow"),
+                requests.exceptions.Timeout("slow"),
             ]
-            result = chat(self._mock_cfg(), [{"role": "user", "content": "hi"}])
-        self.assertEqual(result, {"role": "assistant", "content": ""})
+            with self.assertRaises(ProviderFailure) as cm:
+                chat(self._mock_cfg(), [{"role": "user", "content": "hi"}])
+        self.assertNotIsInstance(cm.exception, EndpointUnreachable)
 
     def test_http_400_path_still_sanitizes(self):
         # Existing 400-retry sanitization (drops poison tool-call messages)

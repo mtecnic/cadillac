@@ -1,4 +1,4 @@
-from cadillac.cadillac import main
+from cadillac.cadillac import _main_guarded
 
 if __name__ == "__main__":
-    main()
+    _main_guarded()
