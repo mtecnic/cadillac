@@ -651,6 +651,16 @@ _RUST_KEYWORDS = frozenset({
 })
 
 
+def _augment_for_web_game(lang: Language, task: str) -> Language:
+    """Append the web-game / PWA addendum to `lang.anti_patterns` when the
+    task keywords suggest a canvas game or PWA. No-op otherwise. Returns the
+    same lang (mutated in place — Language is not frozen)."""
+    addendum = quality.web_game_addendum(task)
+    if addendum:
+        lang.anti_patterns = (lang.anti_patterns or "") + addendum
+    return lang
+
+
 def detect_language(task: str, workspace: str | None = None) -> Language:
     """Detect target language from task description or existing workspace."""
     task_lower = task.lower()
@@ -660,7 +670,7 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
     if any(kw in task_lower for kw in _HTML_INDICATORS):
         if not any(kw in task_lower for kw in _FRAMEWORK_KEYWORDS):
             if not any(kw in task_lower for kw in _PYTHON_KEYWORDS):
-                return html_language()
+                return _augment_for_web_game(html_language(), task)
 
     # Platform-specific detection — check BEFORE generic frameworks.
     # Browser extension / WordPress are NOT just React or PHP apps; they
@@ -706,11 +716,11 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
     )):
         return electron_language()
     if any(kw in task_lower for kw in ("react", "nextjs", "next.js")):
-        return react_language()
+        return _augment_for_web_game(react_language(), task)
     if "vue" in task_lower:
-        return vue_language()
+        return _augment_for_web_game(vue_language(), task)
     if "angular" in task_lower:
-        return angular_language()
+        return _augment_for_web_game(angular_language(), task)
 
     # Python-specific keywords — check BEFORE JS keywords to prevent
     # false positives (e.g., "Flask REST API" should be Python, not TS)

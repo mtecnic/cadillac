@@ -100,12 +100,15 @@ class TestDispatchLibrary(unittest.TestCase):
 
 
 class TestDispatchSkip(unittest.TestCase):
-    def test_static_skips(self):
+    def test_static_now_dispatches_playwright(self):
+        """Previously static family was skipped as "no runtime surface". With
+        the playwright runner in place, a static site with an index.html is
+        exactly the surface playwright can drive."""
         with tempfile.TemporaryDirectory() as ws:
             _mkfile(ws, "index.html", "<html></html>")
             strategy, reason = _pick_strategy(ws, _Lang("html", "static"))
-            self.assertEqual(strategy, "skip")
-            self.assertIn("static", reason)
+            self.assertEqual(strategy, "playwright")
+            self.assertIn("browser", reason.lower())
 
     def test_wordpress_skips(self):
         with tempfile.TemporaryDirectory() as ws:

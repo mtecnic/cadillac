@@ -3440,3 +3440,92 @@ CURRENT ISSUES:
 {instruction}
 
 {code_map}"""
+
+
+# ── Web-game / PWA addenda ────────────────────────────────────────────────────
+#
+# Keyword-conditional addenda concatenated onto REACT/VUE/HTML `anti_patterns`
+# by languages.detect_language() when the task matches. They cover pitfalls
+# that don't come up in generic form/CRUD web apps and that unit tests can't
+# catch: leaked rAF loops across scene transitions, fixed-step game loops
+# that double-speed on 120Hz monitors, per-frame sprite reloads, service
+# workers that silently fail to register.
+
+WEB_GAME_ANTI_PATTERNS = """\
+
+## Anti-patterns to AVOID (canvas / game loop)
+- Do NOT use `setInterval(update, 16)` for the game loop — use \
+`requestAnimationFrame`. Timers stack under tab-throttling; rAF pauses \
+cleanly and gives you delta-time.
+- Do NOT compute movement as `x += 5` per frame. Use delta-time: \
+`x += velocity_px_per_sec * dt`. Frame-based movement runs at 2× speed \
+on a 120Hz monitor and stutters when the browser drops frames.
+- Do NOT forget to `cancelAnimationFrame(handle)` on component unmount / \
+scene transition. Leaked rAF loops keep firing forever, doubling on \
+route change, until the tab dies.
+- Do NOT load a sprite / texture inside the frame loop. Preload ONCE in \
+init and reuse. `new Image(); img.src = "..."` inside `update()` blocks \
+until decode.
+- Do NOT attach `addEventListener("keydown", ...)` in a component without \
+a matching `removeEventListener` in cleanup. Every mount adds one; the \
+handler count grows unbounded.
+- Do NOT read `ctx.getImageData()` per frame — it forces a GPU→CPU \
+readback and tanks perf. Cache to an offscreen canvas.
+- Do NOT use `alert()` / `confirm()` inside the loop — they pause the \
+rAF cycle and produce jank.
+- Do NOT block the main thread with a physics step over 8ms — split it \
+across frames or move to a Worker.
+
+## Anti-patterns to AVOID (PWA)
+- Do NOT register a service worker without a `.catch()` — silent \
+registration failures leave PWAs broken with no signal.
+- Do NOT cache the app shell without a version cache-name — you'll ship \
+a fresh version and users will keep hitting the old one until the SW's \
+TTL expires.
+- Do NOT rely on `beforeinstallprompt` being available in production \
+without a user gesture — Chrome throttles it aggressively.
+- Do NOT put `Cache-Control: no-store` on the service worker file — it's \
+already never cached longer than 24h by browsers; setting no-store on \
+top forces the update path through re-download.
+- Do NOT reference assets in the manifest that don't exist. A missing \
+icon breaks the install prompt silently.
+"""
+
+
+# Task keywords that trigger the web-game addendum.
+_WEB_GAME_KEYWORDS = frozenset({
+    "phaser", "three.js", "threejs", "pixi", "pixijs", "babylon", "babylonjs",
+    "canvas game", "webgl", "game loop", "html5 game", "browser game",
+    "arcade game", "shooter", "platformer", "roguelike browser",
+    "web game", "pwa game", "html canvas",
+})
+
+# Task keywords that trigger the PWA addendum (superset can be either).
+_PWA_KEYWORDS = frozenset({
+    "pwa", "progressive web app", "service worker", "installable web app",
+    "offline-capable web", "web app manifest",
+})
+
+
+def is_web_game_task(task: str) -> bool:
+    """True when the task suggests a canvas / WebGL / browser-game surface."""
+    t = task.lower()
+    return any(kw in t for kw in _WEB_GAME_KEYWORDS)
+
+
+def is_pwa_task(task: str) -> bool:
+    """True when the task suggests a PWA (service worker, offline, install prompt)."""
+    t = task.lower()
+    return any(kw in t for kw in _PWA_KEYWORDS)
+
+
+def web_game_addendum(task: str) -> str:
+    """Return the anti-pattern addendum for game/PWA tasks, or empty string.
+
+    Concatenated onto a Language's `anti_patterns` string by
+    `languages.detect_language()` when the task matches. Empty string means
+    "no addendum needed" — the base language block is sufficient.
+    """
+    if is_web_game_task(task) or is_pwa_task(task):
+        return WEB_GAME_ANTI_PATTERNS
+    return ""

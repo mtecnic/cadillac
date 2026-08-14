@@ -36,6 +36,9 @@ FAILURE_KINDS = (
     "connection_error",     # http: refused / timeout / closed
     "timeout",              # cli/library: process exceeded timeout
     "boot_failure",         # http: backend never bound or crashed at startup
+    "element_not_found",    # playwright: selector matched zero nodes
+    "text_mismatch",        # playwright: selector matched but text differed
+    "console_error",        # playwright: page emitted uncaught error / console.error
 )
 
 

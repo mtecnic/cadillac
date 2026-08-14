@@ -5,18 +5,26 @@ shape, runs it, and returns a `VerificationResult`. Engine code doesn't
 case-switch on strategy — it just consumes the result.
 
 Dispatch chain (first match wins):
-  1. Static site / browser-ext / wordpress           → skip (no surface)
+  1. Browser-ext / wordpress                         → skip (no headless surface)
   2. Interactive (curses/pygame)                     → skip (smoke_run covers)
   3. MCP server (imports mcp SDK)                    → mcp (JSON-RPC over stdio)
-  4. HTTP backend detected (Flask/FastAPI/Express)  → http
-  5. Runnable binary/CLI entry, no HTTP listener     → cli
-  6. Public API surface, no entry runner             → library
-  7. Otherwise                                       → skip
+  4. Browser-served surface (React/Vue/Angular/HTML) → playwright (headless Chromium)
+  5. HTTP backend detected (Flask/FastAPI/Express)   → http
+  6. Runnable binary/CLI entry, no HTTP listener     → cli
+  7. Public API surface, no entry runner             → library
+  8. Otherwise                                       → skip
 
 MCP dispatches BEFORE http and cli because MCP servers have a runnable
 entry (looks like CLI) but the correct probe uses JSON-RPC 2.0 over
 stdio, not argv. Getting this wrong produces 100% "false failure"
 noise on real MCP builds (measured on the 2026-07-02 build).
+
+Playwright dispatches BEFORE http because a full-stack build has both a
+frontend AND a backend — the browser probe exercises the whole stack
+(user clicks, XHR fires, server responds, UI updates), which is a
+strictly stronger signal than hitting the API alone. For backend-only
+builds with no served UI, playwright's serve-cmd detection returns None
+and dispatch falls through to http.
 
 Skip is always graceful — never blocks a build that has no surface to verify.
 """
@@ -54,8 +62,9 @@ def _load_runners() -> dict[str, callable]:
     from .cli_runner import run as cli_run
     from .library_runner import run as library_run
     from .mcp_runner import run as mcp_run
+    from .playwright_runner import run as playwright_run
     return {"http": http_run, "cli": cli_run, "library": library_run,
-            "mcp": mcp_run}
+            "mcp": mcp_run, "playwright": playwright_run}
 
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -73,10 +82,11 @@ def _pick_strategy(workspace: str, lang) -> tuple[str, str]:
     family = getattr(lang, "family", "")
     name = getattr(lang, "name", "")
 
-    # (1) Static / extension / wordpress — nothing to drive end-to-end here.
-    if family == "static" or name in ("wordpress", "browser_extension"):
-        label = f"{name} ({family})" if name and name != family else (name or family)
-        return ("skip", f"static surface — {label} project, no runtime to verify")
+    # (1) Extensions / wordpress — no headless surface. Browser extensions
+    # would need `--load-extension` in a chromium launch args; possible but
+    # non-trivial and out of scope for the general web-runtime pass.
+    if name in ("wordpress", "browser_extension"):
+        return ("skip", f"no headless surface — {name} project")
 
     # (2) Interactive (curses/pygame) — `check_smoke_run` already exercises
     # the entry path with a synthetic screen. Driving real flows would need
@@ -96,7 +106,16 @@ def _pick_strategy(workspace: str, lang) -> tuple[str, str]:
     if family == "python" and _detect_mcp_server(workspace):
         return ("mcp", "MCP server detected (imports mcp SDK)")
 
-    # (4) HTTP backend present?
+    # (4) Browser-served surface — React/Vue/Angular/HTML/static PWA/game.
+    # Must come BEFORE http, because a full-stack build has BOTH a frontend
+    # and a backend; the browser probe drives the whole loop (click → XHR
+    # → server → DOM update) which is a strictly stronger check than the
+    # bare-JSON http probe. If nothing web-servable is present, this falls
+    # through to (5)/http.
+    if _detect_web_surface(workspace, lang):
+        return ("playwright", "browser-served surface detected")
+
+    # (5) HTTP backend present?
     if family in ("python", "node"):
         try:
             from cadillac.validate import _wiring_detect_backend
@@ -105,16 +124,68 @@ def _pick_strategy(workspace: str, lang) -> tuple[str, str]:
         except Exception:
             pass
 
-    # (5) CLI — runnable entry point with no HTTP listener.
+    # (6) CLI — runnable entry point with no HTTP listener.
     if family in ("python", "compiled"):
         if _has_cli_entry(workspace, lang):
             return ("cli", "CLI entry detected")
 
-    # (6) Library — public API surface, no runner.
+    # (7) Library — public API surface, no runner.
     if _has_library_surface(workspace, lang):
         return ("library", "library API surface detected")
 
     return ("skip", "no runtime surface detected")
+
+
+def _detect_web_surface(workspace: str, lang) -> bool:
+    """True when the project has a browser-servable UI.
+
+    Recognizes:
+      - Node projects with `vite` or Angular deps (dev server available)
+      - Static sites with an index.html at the workspace root or in
+        public/ / static/ / www/ / dist/
+    """
+    import json
+    import os
+
+    family = getattr(lang, "family", "")
+    name = getattr(lang, "name", "")
+
+    # Explicit web-family languages that ship a served UI.
+    if name in ("react", "vue", "angular", "html", "electron"):
+        # Electron: skip (its UI lives inside BrowserWindow, not a served
+        # dev server we can hit from playwright's chromium).
+        if name == "electron":
+            return False
+        return True
+
+    # A served frontend can live in a subdir even when the outer language
+    # is Python (full-stack Flask + React/Vue in `frontend/`). Family-agnostic
+    # scan of the well-known frontend directories.
+    for candidate in (workspace, os.path.join(workspace, "frontend"),
+                       os.path.join(workspace, "client"),
+                       os.path.join(workspace, "web"),
+                       os.path.join(workspace, "ui")):
+        pkg = os.path.join(candidate, "package.json")
+        if not os.path.isfile(pkg):
+            continue
+        try:
+            with open(pkg) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        deps = {**(data.get("dependencies") or {}),
+                **(data.get("devDependencies") or {})}
+        if any(k in deps for k in ("vite", "@angular/core",
+                                    "@angular/cli", "next", "svelte")):
+            return True
+
+    # Static: any index.html at root or a well-known subdir
+    for rel in ("", "public", "static", "www", "dist"):
+        cand = os.path.join(workspace, rel) if rel else workspace
+        if os.path.isfile(os.path.join(cand, "index.html")):
+            return True
+
+    return False
 
 
 def _detect_mcp_server(workspace: str) -> bool:
