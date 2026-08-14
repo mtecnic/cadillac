@@ -1643,6 +1643,34 @@ class ModuleScopedExecutor(ToolExecutor):
                          context_budget=context_budget)
         self.module_path = module_path.rstrip("/")
 
+    def run_command(self, command: str) -> dict:
+        """Run a shell command, correcting the cwd misconception on denial.
+
+        Write paths are module-relative (a bare `foo.py` is auto-prefixed with
+        module_path), but the shell deliberately runs at the WORKSPACE ROOT so
+        pytest and cross-module imports resolve. That mismatch reliably teaches
+        the model it is "inside" the module dir, and it then reaches for `../`:
+        observed across four real builds as `ls ../tests/`,
+        `mv x ../tests/core/x.py`, `mkdir -p ../tests/core`. The policy denies
+        those correctly — two of them would have written into the workspace
+        parent — but a bare denial doesn't fix the belief that caused them, so
+        the model tries a variation next round. Naming the actual cwd converts
+        a repeated round-waster into a one-round correction.
+        """
+        result = super().run_command(command)
+        if isinstance(result, dict) and "path_escape" in str(result.get("error", "")):
+            result = {
+                **result,
+                "hint": (
+                    f"Shell commands run from the WORKSPACE ROOT, not from "
+                    f"'{self.module_path}/'. Use workspace-relative paths: this "
+                    f"module's files are under '{self.module_path}/', and a sibling "
+                    f"module is at its own top-level path. A leading '../' leaves "
+                    f"the workspace and is always denied."
+                ),
+            }
+        return result
+
     def normalize_path(self, path: str) -> str:
         """Normalize path for WRITE operations.
 

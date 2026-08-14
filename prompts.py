@@ -535,6 +535,14 @@ TOOLS:
 
 {anti_patterns}
 
+WHERE THINGS RUN — read this before using run_command:
+- `write_file`/`edit_file` paths are MODULE-relative: a bare `foo.py` becomes
+  `{module_path}foo.py` automatically.
+- `run_command` runs from the WORKSPACE ROOT, not from `{module_path}`.
+  So use workspace-relative paths in shell commands: `ls {module_path}` — never
+  `ls .` expecting the module, and never `../` (that escapes the workspace and
+  will be denied). To reach a sibling module, use its own path from the root.
+
 RULES:
 1. Write ONLY files in `{module_path}`. Do NOT write files outside this directory.
 2. Import dependencies using the exact interface signatures shown above.
@@ -587,6 +595,9 @@ RULES:
 - Fix ALL errors per file in one edit_file call.
 - Do NOT modify files outside this module's directory.
 - If you need to check how a dependency works, use search_files to find its exports.
+- `run_command` runs from the WORKSPACE ROOT, not from this module's directory.
+  Use workspace-relative paths (`{module_path}` prefix) in shell commands. A
+  leading `../` escapes the workspace and will be denied.
 
 {validation_failures}
 
@@ -959,10 +970,15 @@ def build_module_build_prompt(
     validation_failures: str = "",
     lessons_text: str = "",
     lang=None,
+    module_path: str = "",
 ) -> str:
     q = _quality_block(lang)
+    # Defaults to the module name when the caller doesn't supply a path, so the
+    # cwd guidance still names something concrete rather than an empty string.
+    module_path = (module_path or module_name).rstrip("/") + "/"
     return _MODULE_BUILD_TEMPLATE.format(
         module_name=module_name,
+        module_path=module_path,
         module_test=module_test,
         interface_stubs=interface_stubs,
         code_map=code_map,

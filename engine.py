@@ -713,21 +713,40 @@ def _write_python_entry_stub(workspace: str, entry_path: str) -> bool:
     full = os.path.join(workspace, entry_path)
     if os.path.exists(full):
         return False  # already there — LLM may have written it, don't overwrite
-    stub = (
-        "#!/usr/bin/env python3\n"
-        '"""Entry point — declared in plan.entry_point.\n\n'
-        "Fill in main() with CLI parsing and dispatch. The --test flag should run\n"
-        "pytest (or your own tests) and exit 0/1.\n"
-        '"""\n'
-        "from __future__ import annotations\n"
-        "import sys\n\n\n"
-        "def main(argv: list[str] | None = None) -> int:\n"
-        "    argv = sys.argv[1:] if argv is None else argv\n"
-        "    # TODO: parse argv, dispatch subcommands / --test / --file\n"
-        "    return 0\n\n\n"
-        'if __name__ == "__main__":\n'
-        "    sys.exit(main())\n"
-    )
+
+    # A package __init__.py is a PUBLIC API surface, not a CLI entry point.
+    # Stamping the argv/main() template into one told a library build that its
+    # package root was a runnable script: the model then had to unlearn it, the
+    # library-surface detector could not recognise the project (an __init__ with
+    # a main() and no re-exports), and a real build's own reflection produced the
+    # lesson "relying on main.py as the entry point for a library" as an
+    # anti-pattern it had to discover the hard way.
+    if os.path.basename(entry_path) == "__init__.py":
+        stub = (
+            '"""Public API for this package.\n\n'
+            "Re-export the package's public surface here so callers can\n"
+            "`from <package> import <name>` without reaching into submodules.\n"
+            "Keep `__all__` in sync with what is actually exported.\n"
+            '"""\n'
+            "from __future__ import annotations\n\n"
+            "__all__: list[str] = []\n"
+        )
+    else:
+        stub = (
+            "#!/usr/bin/env python3\n"
+            '"""Entry point — declared in plan.entry_point.\n\n'
+            "Fill in main() with CLI parsing and dispatch. The --test flag should run\n"
+            "pytest (or your own tests) and exit 0/1.\n"
+            '"""\n'
+            "from __future__ import annotations\n"
+            "import sys\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    argv = sys.argv[1:] if argv is None else argv\n"
+            "    # TODO: parse argv, dispatch subcommands / --test / --file\n"
+            "    return 0\n\n\n"
+            'if __name__ == "__main__":\n'
+            "    sys.exit(main())\n"
+        )
     os.makedirs(os.path.dirname(full) or workspace, exist_ok=True)
     with open(full, "w") as f:
         f.write(stub)
@@ -2770,6 +2789,7 @@ def _build_module(
         validation_failures=pre_build_failures,
         lessons_text=lessons_text,
         lang=lang,
+        module_path=module_path,
     )
     combined_scratch = "\n\n".join(p for p in [root_scratch, dep_scratches, executor.scratch.read()] if p.strip())
     messages = _build_messages(build_prompt, f"Fix and test the {module_name} module.",
@@ -3169,6 +3189,7 @@ def _iterate_module(
         validation_failures=failures_text,
         lessons_text=lessons_text,
         lang=lang,
+        module_path=module_path,
     )
 
     executor = ModuleScopedExecutor(workspace, manifest, module_path,
