@@ -385,3 +385,56 @@ class TestHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnvPrefixAndSed(_PolicyCase):
+    """Two false positives observed on the FastAPI build.
+
+    `API_KEY=test-secret python3 -m pytest` names its program THIRD. The
+    allowlist took tokens[0] literally and rejected the ASSIGNMENT as an unknown
+    command — on a task whose spec required "an API key read from an environment
+    variable", so env-prefixed test runs were the natural thing to write. The
+    shape layer already stripped these; the allowlist did not. Two layers of one
+    gate disagreeing — the defect shape that recurred throughout this work.
+
+    `sed` was simply absent from the allowlist despite builds reaching for it
+    constantly; it is now allowlisted AND treated as a writer, so its paths are
+    escape-checked.
+    """
+
+    def test_env_prefixed_command_is_allowed(self):
+        self.assertAllowed("API_KEY=test-secret python3 -m pytest -q")
+
+    def test_multiple_env_assignments_are_allowed(self):
+        self.assertAllowed("A=1 B=2 npm test")
+
+    def test_env_prefix_with_path_value_is_allowed(self):
+        self.assertAllowed("DB_PATH=/tmp/x.db python3 -m pytest")
+
+    def test_env_prefix_cannot_launder_a_non_allowlisted_program(self):
+        self.assertDenied("FOO=1 git push", rule="allowlist")
+
+    def test_env_prefix_cannot_launder_a_path_escape(self):
+        self.assertDenied("API_KEY=x rm -rf ..", rule="path_escape")
+
+    def test_env_prefix_cannot_launder_credential_access(self):
+        self.assertDenied("A=1 cat ~/.ssh/id_rsa", rule="credential")
+
+    def test_sed_in_workspace_is_allowed(self):
+        self.assertAllowed("sed -i s/a/b/ src/app.py")
+
+    def test_sed_outside_workspace_is_denied(self):
+        """Allowlisting sed must not exempt it from the write rules."""
+        self.assertDenied("sed -i s/a/b/ ../outside.py", rule="path_escape")
+
+    def test_sed_on_a_credential_path_is_denied(self):
+        self.assertDenied("sed -i s/a/b/ ~/.ssh/config", rule="credential")
+
+    def test_both_layers_share_one_stripper(self):
+        """The allowlist and the shape check must not disagree again."""
+        import inspect
+
+        from cadillac.tools import _check_command_shape, validate_command
+        for fn in (validate_command, _check_command_shape):
+            self.assertIn("strip_command_prefixes", inspect.getsource(fn),
+                          f"{fn.__name__} does not use the shared prefix stripper")

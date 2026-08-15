@@ -347,6 +347,11 @@ ALLOWED_COMMANDS = {
     "echo", "env", "which", "file", "stat", "curl",
     "cd", "timeout", "pwd", "lsof", "ss", "netstat",
     "true", "false", "test",
+    # sed: builds reach for it constantly for in-place edits. It is covered by
+    # the shape policy's write rules (path escapes are still denied) and by
+    # _CONFIG_WRITE_SHELL_RE, which already blocks `sed -i` against protected
+    # config files.
+    "sed",
 }
 
 BLOCKED_PATTERNS = [
@@ -450,6 +455,9 @@ _WRAPPER_COMMANDS = frozenset({"timeout", "env", "command", "exec", "nice", "noh
 # workspace is a hard denial for these.
 _WRITE_COMMANDS = frozenset({
     "rm", "mv", "cp", "mkdir", "touch", "chmod", "tee", "truncate", "ln", "dd", "shred",
+    # sed is allowlisted for in-place edits, so its path arguments must be
+    # escape-checked like any other writer: `sed -i ../outside.py` is a write.
+    "sed",
 })
 
 # Programs that read file contents or enumerate the filesystem. Used for the
@@ -602,6 +610,36 @@ def _extract_subshells(command: str) -> list[str]:
     return bodies
 
 
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_command_prefixes(tokens: list[str]) -> list[str]:
+    """Drop leading env assignments and no-op wrappers to reach the real program.
+
+    `API_KEY=test python3 -m pytest` names its program third, not first. The
+    allowlist took tokens[0] literally and rejected the ASSIGNMENT as an unknown
+    command — on a task whose spec required an API key in an environment
+    variable, so env-prefixed test runs were the natural thing to write. The
+    shape layer already stripped these; the allowlist did not, which is two
+    layers of one gate disagreeing. Both now call this.
+    """
+    out = list(tokens)
+    while out:
+        head = out[0]
+        if _ENV_ASSIGN_RE.match(head):
+            out = out[1:]
+            continue
+        if os.path.basename(head.lstrip("({").rstrip(")}")) in _WRAPPER_COMMANDS:
+            out = out[1:]
+            # `timeout 60 cmd` / `env FOO=1 cmd`: drop the wrapper's own operands
+            while out and (re.fullmatch(r"\d+[smhd]?", out[0])
+                           or _ENV_ASSIGN_RE.match(out[0])):
+                out = out[1:]
+            continue
+        break
+    return out
+
+
 def _segment_tokens(part: str) -> list[str]:
     """Tokenize one command segment, quote-aware, tolerant of shell syntax."""
     import shlex
@@ -646,12 +684,7 @@ def _check_command_shape(command: str, workspace: str | None) -> tuple[bool, str
     for part in _split_command_parts(command):
         part = re.sub(r"\d*>>&?\s*\S+", "", part)
         part = re.sub(r"\d*>&?\d+", "", part)
-        tokens = _segment_tokens(part.strip())
-        while tokens and os.path.basename(tokens[0]) in _WRAPPER_COMMANDS:
-            tokens = tokens[1:]
-            # `timeout 60 cmd` / `env FOO=1 cmd`: drop the wrapper's own operands
-            while tokens and (re.fullmatch(r"\d+[smhd]?", tokens[0]) or "=" in tokens[0].split("/")[0]):
-                tokens = tokens[1:]
+        tokens = strip_command_prefixes(_segment_tokens(part.strip()))
         if not tokens:
             continue
         exe = os.path.basename(tokens[0])
@@ -762,7 +795,7 @@ def validate_command(command: str, workspace: str | None = None) -> tuple[bool, 
             part = re.sub(r'\d*>>&?\s*\S+', '', part)  # 2>/dev/null, >>/file
             part = re.sub(r'\d*>&?\d+', '', part)       # 2>&1
             part = part.strip()
-            tokens = part.split()
+            tokens = strip_command_prefixes(part.split())
             if not tokens:
                 continue
             # Strip subshell/group punctuation so `(rm -rf ..)` reports as `rm`
