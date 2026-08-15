@@ -193,3 +193,58 @@ class TestPlanPromptStatesLibraryLayout(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVerdictPersistsUntilACleanPass(unittest.TestCase):
+    """The gap in my FIRST attempt at this fix.
+
+    Attempt 1 recorded unresolved findings only on the retreat-BLOCKED branch.
+    But the common path is the opposite: retreat SUCCEEDS, the loop bounces to
+    BUILD, and because `runtime_verify_done` stays True RUNTIME never re-runs to
+    confirm the fix. Nothing was recorded, so the failure was silently forgotten
+    and the build reported success.
+
+    Build 11 shipped exactly that — `[AUTO] All validations pass!` for a library
+    whose own UTF-8-truncation usage example still failed (12/13 passing when the
+    cached probes were re-run against the packaged artifact).
+
+    Correct semantics: record on ANY actionable findings, clear only on a CLEAN
+    pass. Last verdict wins, and absence of a re-check is not a pass.
+    """
+
+    def _src(self):
+        import inspect
+
+        from cadillac.engine import run
+        return inspect.getsource(run)
+
+    def test_runtime_records_before_deciding_what_to_do(self):
+        src = self._src()
+        i = src.index("actionable_rt = list(")
+        j = src.index("bouncing to BUILD", i)
+        self.assertIn("_record_runtime_failures", src[i:j],
+                      "RUNTIME must record its verdict before the retreat "
+                      "decision, not only when retreat is blocked")
+
+    def test_critic_records_before_deciding_what_to_do(self):
+        src = self._src()
+        i = src.index("actionable = [m for m in missing")
+        j = src.index("bouncing to BUILD for a", i)
+        self.assertIn("_record_runtime_failures", src[i:j],
+                      "CRITIC must record its verdict before the retreat decision")
+
+    def test_a_clean_pass_clears_the_record(self):
+        """Otherwise a fixed build would be permanently marked failing."""
+        src = self._src()
+        self.assertIn("_clear_runtime_failures", src)
+        # Both clean paths must clear: RUNTIME's no-failure branch and CRITIC's.
+        i = src.index("[CRITIC] no actionable gaps")
+        self.assertIn("_clear_runtime_failures", src[i:i + 200])
+
+    def test_record_then_clear_round_trip(self):
+        with tempfile.TemporaryDirectory() as ws:
+            _record_runtime_failures(ws, "library", [_Failure()])
+            self.assertIsNotNone(read_runtime_failures(ws))
+            _clear_runtime_failures(ws)
+            self.assertIsNone(read_runtime_failures(ws),
+                              "a clean pass must retract the previous verdict")

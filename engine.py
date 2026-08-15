@@ -4781,6 +4781,13 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             actionable = [m for m in missing
                                           if m.severity in ("high", "medium")]
                             if actionable:
+                                # Record before acting, for the same reason as
+                                # RUNTIME below: a successful retreat does not
+                                # guarantee CRITIC re-runs to confirm the gaps
+                                # were closed, and recording only on the blocked
+                                # branch let them vanish. Cleared by a clean pass.
+                                _record_runtime_failures(
+                                    workspace, "critic", actionable)
                                 instr = format_for_iterate(actionable)
                                 emit("log", msg=(
                                     f"[CRITIC] {len(actionable)} actionable "
@@ -4837,6 +4844,7 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                                 ])
                             else:
                                 emit("log", msg="[CRITIC] no actionable gaps")
+                                _clear_runtime_failures(workspace)
                         except Exception as _e:
                             emit("log", msg=f"[CRITIC] crashed (advisory): {_e}")
 
@@ -4870,6 +4878,20 @@ def run(task: str, workspace: str, cfg: Config, emitter: EventEmitter | None = N
                             ))
                             actionable_rt = list(rt_result.actionable_failures)
                             if actionable_rt:
+                                # Record the verdict NOW, before deciding what to
+                                # do about it. Recording only on the
+                                # retreat-BLOCKED branch left the common path
+                                # unguarded: retreat succeeds, the loop bounces
+                                # to BUILD, and because `runtime_verify_done`
+                                # stays True RUNTIME never re-runs to confirm the
+                                # fix — so the failure was silently forgotten and
+                                # the build reported success anyway. Build 11
+                                # shipped a library failing its own UTF-8
+                                # truncation example that way. The record is
+                                # cleared only by a subsequent CLEAN runtime
+                                # pass, so "last verdict wins" holds either way.
+                                _record_runtime_failures(
+                                    workspace, rt_result.strategy, actionable_rt)
                                 instr = _rt_fmt(actionable_rt)
                                 emit("log", msg=(
                                     f"[RUNTIME] {len(actionable_rt)} actionable "
