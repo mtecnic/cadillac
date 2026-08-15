@@ -729,6 +729,53 @@ def detect_language(task: str, workspace: str | None = None) -> Language:
 
     if any(kw in task_lower for kw in _JS_KEYWORDS):
         return typescript_language()
-    if workspace and os.path.exists(os.path.join(workspace, "package.json")):
-        return typescript_language()
+    # Workspace fallback. Prefer what the code ACTUALLY IS over the presence of
+    # a single marker file: `iterate()` calls this with an empty task string, so
+    # this branch decides the language for the whole post-build phase.
+    #
+    # Trusting package.json alone misrouted a 21-file Python FastAPI project to
+    # typescript, because a spurious "unresolved import 'aiosqlite'" had led the
+    # model to call add_dep(), which wrote a package.json containing a PYTHON
+    # package. Every subsequent validation then ran as TS: "node_modules
+    # missing", ".test.ts" discovery, "no tsconfig.json". Counting source files
+    # makes that impossible — one stray manifest cannot outvote the tree.
+    if workspace:
+        dominant = _dominant_source_language(workspace)
+        if dominant is not None:
+            return dominant
+        if os.path.exists(os.path.join(workspace, "package.json")):
+            return typescript_language()
     return python_language()
+
+
+def _dominant_source_language(workspace: str):
+    """Language implied by the source files present, or None when ambiguous.
+
+    Counts hand-written sources only — generated/vendored trees would otherwise
+    swamp the signal. Returns None when there is nothing to go on, so callers
+    keep their existing fallbacks.
+    """
+    skip = {"__pycache__", "node_modules", ".git", ".cadillac", ".venv",
+            "venv", "dist", "build", "site-packages"}
+    counts: dict[str, int] = {}
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+        for f in files:
+            for ext, key in ((".py", "python"), (".ts", "ts"), (".tsx", "ts"),
+                             (".js", "ts"), (".jsx", "ts"), (".go", "go"),
+                             (".rs", "rust")):
+                if f.endswith(ext):
+                    counts[key] = counts.get(key, 0) + 1
+                    break
+    if not counts:
+        return None
+    best, n = max(counts.items(), key=lambda kv: kv[1])
+    # Require a clear majority; a mixed tree stays ambiguous for the caller.
+    if n < 2 or n <= sum(counts.values()) / 2:
+        return None
+    return {
+        "python": python_language,
+        "ts": typescript_language,
+        "go": go_language,
+        "rust": rust_language,
+    }[best]()

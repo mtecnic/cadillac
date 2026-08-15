@@ -219,6 +219,93 @@ _PEP668_OPT_OUT_FLAGS = ("--user", "--target", "--prefix", "--root",
                          "--break-system-packages")
 
 
+_VENV_DIRNAME = ".venv"
+
+
+def workspace_venv_python(workspace: str) -> str | None:
+    """Path to the workspace venv's python, creating the venv on first use.
+
+    Builds install their own dependencies, and until now `pip3 install` ran
+    against the HOST interpreter. A generated requirements.txt pinning
+    `pydantic==2.6.1` / `pydantic-settings==2.1.0` was installed globally and
+    downgraded the machine's own packages from 2.12.5 / 2.13.1, which broke the
+    unrelated `mcp` SDK for everything on the box. An unattended builder must
+    not be able to do that.
+
+    `--system-site-packages` is deliberate: everything already installed on the
+    host stays importable, so builds keep working exactly as before, but
+    anything a build INSTALLS lands in the workspace and merely shadows the
+    host copy. Nothing outside the workspace is ever modified, and deleting the
+    workspace fully undoes it.
+
+    Returns None when the venv cannot be created; callers must then refuse the
+    install rather than silently falling back to the host interpreter.
+    """
+    venv_dir = os.path.join(workspace, _VENV_DIRNAME)
+    # `python3`, not `python`: the command allowlist permits python3, and every
+    # venv creates both symlinks. Using the bare name would need an allowlist
+    # change purely as a side effect of this rewrite.
+    py = os.path.join(venv_dir, "bin", "python3")
+    pip = os.path.join(venv_dir, "bin", "pip")
+    if os.path.exists(py) and os.path.exists(pip):
+        return py
+
+    # Two creators, because stdlib venv is not always usable: on Debian/Ubuntu
+    # without the `python3-venv` package, `python3 -m venv` happily creates the
+    # interpreter symlinks and then fails at ensurepip, leaving a venv with NO
+    # pip in it. That half-built state is why this verifies pip exists rather
+    # than trusting the return code. `virtualenv` bundles its own pip and needs
+    # no system package, so it is the fallback.
+    attempts = (
+        ["python3", "-m", "venv", "--system-site-packages", venv_dir],
+        ["python3", "-m", "virtualenv", "--system-site-packages", venv_dir],
+    )
+    for cmd in attempts:
+        try:
+            os.makedirs(workspace, exist_ok=True)
+            subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except Exception:
+            continue
+        if os.path.exists(py) and os.path.exists(pip):
+            return py
+    return None
+
+
+def _venv_env(workspace: str) -> dict:
+    """Environment for workspace commands, with the venv's bin/ first on PATH.
+
+    Makes `python3`, `pip3` and console scripts like `pytest` resolve to the
+    workspace venv when one exists, so a build's own installs are what its
+    tests actually run against.
+    """
+    env = dict(os.environ)
+    venv_dir = os.path.join(workspace, _VENV_DIRNAME)
+    bin_dir = os.path.join(venv_dir, "bin")
+    if os.path.isdir(bin_dir):
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        env["VIRTUAL_ENV"] = venv_dir
+        # A stale PYTHONHOME would defeat the venv entirely.
+        env.pop("PYTHONHOME", None)
+    return env
+
+
+def _redirect_pip_to_venv(command: str, venv_python: str) -> str:
+    """Point every pip-install invocation in `command` at the workspace venv.
+
+    Rewrites the pip executable only — flags, packages and `-r requirements.txt`
+    are left exactly as written, so the build's intent is preserved and only its
+    DESTINATION changes. `--break-system-packages` is stripped: it exists solely
+    to override the host's PEP 668 guard and is meaningless (and alarming)
+    inside a venv.
+    """
+    out = re.sub(
+        r'(?<![\w./-])(?:python3?\s+-m\s+pip|pip3?)(?=\s+install\b)',
+        f'{venv_python} -m pip',
+        command,
+    )
+    return out.replace(" --break-system-packages", "")
+
+
 def _rewrite_pip_for_pep668(command: str) -> str:
     """Append `--break-system-packages` to pip install invocations when the
     host has the marker and the user hasn't already chosen a scope. No-op on
@@ -1328,9 +1415,28 @@ class ToolExecutor:
         # Rewrite /testbed references — Qwen models hallucinate this path
         command = command.replace('/testbed/', './')
         command = re.sub(r'/testbed\b', '.', command)
-        # Ubuntu 24.04 / Debian 12+ PEP 668: pip install against system
-        # Python errors out; auto-add --break-system-packages when needed.
-        command = _rewrite_pip_for_pep668(command)
+        # Dependency installs go into a workspace-local venv, never the host.
+        # A build previously installed a generated requirements.txt globally and
+        # downgraded the machine's pydantic (2.12.5 -> 2.6.1), breaking the
+        # unrelated `mcp` SDK for everything on the box. Fail CLOSED: if the
+        # venv cannot be created we refuse the install, because the fallback is
+        # exactly the damage being prevented.
+        if _PIP_INSTALL_RE.search(command):
+            venv_py = workspace_venv_python(self.workspace)
+            if not venv_py:
+                return {
+                    "exit_code": 1, "stdout": "",
+                    "stderr": (
+                        "Refusing to install: could not create the workspace "
+                        "virtualenv, and installing into the host Python is not "
+                        "permitted (it can downgrade system packages). Check that "
+                        "`python3 -m venv` works, then retry."
+                    ),
+                }
+            command = _redirect_pip_to_venv(command, venv_py)
+        else:
+            # PEP 668 only applies to host-Python installs; venv pip is exempt.
+            command = _rewrite_pip_for_pep668(command)
         allowed, reason = validate_command(command, workspace=self.workspace)
         if not allowed:
             return {"error": reason}
@@ -1354,6 +1460,9 @@ class ToolExecutor:
             result = subprocess.run(
                 command, shell=True, cwd=self.workspace,
                 capture_output=True, text=True, timeout=effective_timeout,
+                # venv bin/ first on PATH so `python3`, `pytest` and friends
+                # resolve to what this build installed, not the host copies.
+                env=_venv_env(self.workspace),
             )
             elapsed_ms = int((_time.monotonic() - t0) * 1000)
             _record_cmd_history(self.workspace, _cmd_kind(command),

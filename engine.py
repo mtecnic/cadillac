@@ -2247,6 +2247,44 @@ def read_runtime_failures(workspace: str) -> dict | None:
     return data if isinstance(data, dict) and data.get("count") else None
 
 
+_NO_TESTS_MARKERS = (
+    "no tests ran",
+    "no tests collected",
+    "file or directory not found",
+    "error: not found",
+)
+
+
+def _tests_actually_passed(cmd_str: str, result) -> bool:
+    """True only when a test command ran tests AND they passed.
+
+    Exit code 0 alone is not evidence. A real ITERATE round produced:
+
+        exit_code 0, "ERROR: file or directory not found:
+                      services/test_services.py ... no tests ran in 0.09s"
+        -> "[ITERATE/services] Tests pass!"
+
+    Zero tests executed and the loop declared victory, then moved on. The three
+    call sites had drifted: BUILD required `"passed" in stdout`, while MODULE
+    and ITERATE checked only the exit code. This is the single predicate all
+    three now share, so they cannot disagree again.
+    """
+    if not isinstance(result, dict):
+        return False
+    if "pytest" not in (cmd_str or "") and "jest" not in (cmd_str or "") \
+            and "vitest" not in (cmd_str or ""):
+        return False
+    if result.get("exit_code") != 0:
+        return False
+    out = ((result.get("stdout") or "") + (result.get("stderr") or "")).lower()
+    if any(m in out for m in _NO_TESTS_MARKERS):
+        return False
+    if "failed" in out or "error" in out:
+        return False
+    # Positive evidence that something actually executed.
+    return "passed" in out or " ok" in out
+
+
 def _write_succeeded(result) -> bool:
     """True when a write_file / write_test tool result reports a real write.
 
@@ -2910,7 +2948,7 @@ def _build_module(
         # Check if tests pass
         if last_run:
             cmd_str, cmd_result = last_run
-            if ("pytest" in cmd_str and cmd_result.get("exit_code") == 0):
+            if _tests_actually_passed(cmd_str, cmd_result):
                 emit("log", msg=f"[MODULE {module_name}] Tests pass!")
                 break
             if (cmd_result.get("exit_code") == 0
@@ -3297,7 +3335,7 @@ def _iterate_module(
 
         if last_run:
             cmd_str, cmd_result = last_run
-            if ("pytest" in cmd_str and cmd_result.get("exit_code") == 0):
+            if _tests_actually_passed(cmd_str, cmd_result):
                 emit("log", msg=f"[ITERATE/{module_name}] Tests pass!")
                 break
 
@@ -6201,10 +6239,8 @@ def enhance(
 
             # Check if tests pass
             if last_run:
-                _, cmd_result = last_run
-                stdout = cmd_result.get("stdout", "")
-                exit_code = cmd_result.get("exit_code", 1)
-                if exit_code == 0 and "passed" in stdout and "failed" not in stdout.lower():
+                cmd_str, cmd_result = last_run
+                if _tests_actually_passed(cmd_str, cmd_result):
                     emit("log", msg="[BUILD] Tests pass!")
                     break
         else:
