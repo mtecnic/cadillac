@@ -1043,6 +1043,52 @@ def _extract_import_module(line: str) -> str | None:
     return None
 
 
+_INSTALLED_IMPORTS_CACHE: dict[str, set] = {}
+
+
+def installed_import_names(workspace: str | None = None) -> set:
+    """Top-level import names actually available to a build.
+
+    Uses `importlib.metadata.packages_distributions()`, which maps IMPORT names
+    to distributions — so `yaml`, `PIL` and `bs4` resolve correctly without the
+    hand-maintained alias table the old code carried, and `pydantic_settings`
+    matches the `pydantic-settings` distribution without any hyphen/underscore
+    juggling. That mismatch was a real false positive: the module name was
+    normalised while the distribution key was not, so the two could never
+    compare equal.
+
+    Queries the workspace venv's interpreter when one exists, because
+    dependency installs now land there rather than on the host; falls back to
+    the host interpreter. Results are cached per workspace — validation runs
+    many times per build and this is a subprocess.
+    """
+    key = workspace or ""
+    if key in _INSTALLED_IMPORTS_CACHE:
+        return _INSTALLED_IMPORTS_CACHE[key]
+
+    interpreters = []
+    if workspace:
+        venv_py = os.path.join(workspace, ".venv", "bin", "python3")
+        if os.path.exists(venv_py):
+            interpreters.append(venv_py)
+    interpreters.append("python3")
+
+    probe = ("from importlib.metadata import packages_distributions as p; "
+             "print(' '.join(sorted(p())))")
+    names: set = set()
+    for py in interpreters:
+        try:
+            r = subprocess.run([py, "-c", probe],
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode == 0:
+                names.update(r.stdout.split())
+        except Exception:
+            continue
+    if names:
+        _INSTALLED_IMPORTS_CACHE[key] = names
+    return names
+
+
 def check_imports(workspace: str, lang=None) -> list[CheckResult]:
     """Check that all imports can be resolved."""
     if lang and lang.family == "node":
@@ -1057,19 +1103,12 @@ def check_imports(workspace: str, lang=None) -> list[CheckResult]:
         elif os.path.isdir(os.path.join(workspace, f)) and not f.startswith((".", "_")):
             local_modules.add(f)  # directories are potential packages
 
-    # Get installed third-party packages
-    installed = set()
-    try:
-        r = subprocess.run(
-            ["python3", "-c", "import pkg_resources; print(' '.join(d.key for d in pkg_resources.working_set))"],
-            capture_output=True, text=True, timeout=10, cwd=workspace,
-        )
-        if r.returncode == 0:
-            installed = set(r.stdout.strip().split())
-            # Also add common package import name mappings
-            installed.update({"PIL", "cv2", "sklearn", "bs4", "yaml", "dotenv"})
-    except Exception:
-        pass
+    # Import names actually available (workspace venv first, then host).
+    # The previous probe used pkg_resources DISTRIBUTION keys and normalised
+    # only the module side, so `pydantic_settings` could never match the
+    # `pydantic-settings` key — a false "unresolved import" for any hyphenated
+    # distribution. packages_distributions() returns real import names.
+    installed = installed_import_names(workspace)
 
     failures = []
     for f in os.listdir(workspace):
@@ -1088,14 +1127,16 @@ def check_imports(workspace: str, lang=None) -> list[CheckResult]:
                     if not module:
                         continue
                     # Skip if it's stdlib, local, or installed
-                    if module in _STDLIB_NAMES or module in local_modules or module.lower().replace("-", "_") in installed:
+                    if module in _STDLIB_NAMES or module in local_modules or module in installed:
                         continue
-                    # Check common package aliases
-                    if module in {"click", "rich", "pydantic", "aiosqlite", "flask", "fastapi",
-                                  "uvicorn", "sqlalchemy", "requests", "httpx", "pytest", "numpy",
-                                  "pandas", "torch", "aiohttp", "websockets", "redis", "celery",
-                                  "jinja2", "marshmallow", "attrs", "pendulum", "arrow"}:
-                        continue  # Known packages that might not show in pkg_resources
+                    # NOTE: a hardcoded allowlist of "packages that might not
+                    # show in pkg_resources" used to sit here. It was a
+                    # workaround for the pkg_resources probe that
+                    # installed_import_names() replaced, and it cut both ways —
+                    # masking genuinely-missing dependencies whose names happened
+                    # to be on it, while anything off the list produced a false
+                    # positive. packages_distributions() reports real import
+                    # names, so neither workaround is needed.
                     failures.append(
                         CheckResult("imports", False,
                                     f"{f}:{lineno}: unresolved import '{module}' — "
@@ -1194,6 +1235,10 @@ def run_module_validation(workspace: str, module_path: str, module_test_file: st
             if f.endswith(".py"):
                 local_modules.add(os.path.splitext(f)[0])
 
+        # Same source of truth as the workspace-level check, so the two cannot
+        # disagree about whether a dependency exists.
+        installed = installed_import_names(workspace)
+
         import_failures = []
         for root, _, files in os.walk(module_dir):
             if "__pycache__" in root:
@@ -1216,10 +1261,15 @@ def run_module_validation(workspace: str, module_path: str, module_test_file: st
                                 continue
                             if module in _STDLIB_NAMES or module in local_modules:
                                 continue
-                            # Skip known packages
-                            if module in {"click", "rich", "pydantic", "flask", "fastapi",
-                                          "uvicorn", "sqlalchemy", "requests", "httpx", "pytest",
-                                          "numpy", "pandas", "torch", "aiohttp"}:
+                            # Ask what is ACTUALLY installed rather than consult
+                            # a hardcoded list. The old 14-name set reported
+                            # `aiosqlite` and `pydantic_settings` as unresolved
+                            # while both were installed and importable, failing
+                            # two healthy modules — and the model "fixed" that by
+                            # calling add_dep(), which wrote a package.json full
+                            # of Python packages and misrouted the whole build's
+                            # language detection to TypeScript.
+                            if module in installed:
                                 continue
                             import_failures.append(
                                 CheckResult("imports", False,
