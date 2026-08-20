@@ -72,7 +72,29 @@ command entry point must create its own connection and close it in a finally blo
 into packages (models/, routes/, services/, utils/) with __init__.py files
 - NEVER wrap module imports in try/except ImportError with inline class fallbacks. If `from rendering \
 import Drawer` fails, that's a REAL BUG — fix the module, don't duplicate the class inline. Fallback \
-blocks hide broken modules and make all tests pass against fake implementations."""
+blocks hide broken modules and make all tests pass against fake implementations.
+- NEVER create a package directory without an `__init__.py` in it — including nested \
+directories (`pkg/`, `pkg/sub/`) and test directories inside packages. This is the single \
+most common cause of ModuleNotFoundError in these builds.
+- NEVER re-export a name from `__init__.py` before the file providing it exists. \
+`from .storage import Store` in `storage/__init__.py` breaks the whole package while \
+`storage/storage.py` is missing — write the implementation file first, re-export second.
+- NEVER leave a planned module directory empty. A declared module with no source files in \
+it fails validation and breaks every import targeting it. If a module turns out \
+unnecessary, delete the directory rather than leaving it empty.
+- NEVER write an entry point without an `if __name__ == "__main__":` block that calls it. \
+Without the guard the file imports cleanly but does nothing when run, so \
+`python3 main.py --test` succeeds while testing nothing.
+- NEVER hardcode ports, file paths, or config values inside modules. Take them as a \
+parameter or read them from the environment with a default \
+(`os.environ.get("PORT", "8000")`). Hardcoding `./data.json` in five modules means five \
+places to change and five ways to disagree.
+- NEVER use `SELECT ... FOR UPDATE` in SQLite — it is not supported and provides no \
+locking. For an atomic claim/lease, do the read AND the write inside one \
+`BEGIN IMMEDIATE` transaction so a competing writer blocks instead of racing.
+- NEVER write `async def test_*` without pytest-asyncio configured: add it to dependencies \
+AND set `asyncio_mode = "auto"` in pytest config, or the async tests are silently skipped \
+or error on a missing event loop."""
 
 
 FEW_SHOT_SCAFFOLD = """\
@@ -523,7 +545,15 @@ TS_ANTI_PATTERNS = """\
 - NEVER modify tsconfig.json to change "module" from "commonjs" — the boilerplate is correct, do not touch it
 - NEVER set "rootDir" in tsconfig.json — it breaks compilation when test files are outside the root dir
 - NEVER start an Express server in --test without shutting it down cleanly: \
-`const server = app.listen(port, () => {{ runTests().then(() => server.close(() => process.exit(0))) }});`"""
+`const server = app.listen(port, () => {{ runTests().then(() => server.close(() => process.exit(0))) }});`
+- NEVER leave a barrel `index.ts` incomplete. If a directory has an `index.ts`, it must \
+re-export EVERY public symbol in that directory — a missing export is invisible to `tsc` \
+in the defining file and only fails at the import site, often in a different module.
+- NEVER call `app.listen()` unguarded in a file that also exports the app. Export the app \
+for tests and guard the listen: `if (require.main === module) {{ app.listen(port); }}` — \
+otherwise importing it in a test starts a real server and hangs the run.
+- NEVER hardcode a port or file path in a module. Use `process.env.PORT ?? 3000` and pass \
+paths in, so tests can point at a temp location instead of fighting a baked-in one."""
 
 TS_FEW_SHOT_SCAFFOLD = """\
 ## Example: Writing a well-structured TypeScript file
