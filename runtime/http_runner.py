@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -82,7 +83,7 @@ Output JSON only — no prose, no fences. Schema:
         {
           "method": "POST",
           "path": "/auth/signup",
-          "body": {"email": "test@example.com", "password": "secret-pw-1234"},
+          "body": {"email": "test@example.com", "password": "Test-Pw-42!"},
           "expect_status": 201,
           "capture": {"token": "$.token"}
         },
@@ -280,10 +281,12 @@ def _boot_backend(workspace: str, be: dict, emit) -> tuple[subprocess.Popen | No
         ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     # Common defaults so the backend doesn't fail-fast on a missing env var
     # during verification. If the operational gate already enforces these,
-    # the verifier doesn't need to bypass them again.
-    env.setdefault("JWT_SECRET", "verification-secret-32chars-long-x")
+    # the verifier doesn't need to bypass them again. Secrets are random
+    # per-run so no credential ever ships in source.
+    _run_secret = secrets.token_urlsafe(32)
+    env.setdefault("JWT_SECRET", _run_secret)
     env.setdefault("DATABASE_URL", "sqlite:///:memory:")
-    env.setdefault("APP_SECRET_KEY", "verification-secret-32chars-long-x")
+    env.setdefault("APP_SECRET_KEY", _run_secret)
     env.setdefault("BCRYPT_ROUNDS", "4")
 
     try:
